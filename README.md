@@ -20,6 +20,7 @@
 - [Автоматизация через cron](#автоматизация-через-cron)
 - [Коды выхода](#коды-выхода)
 - [Структура файлов](#структура-файлов)
+- [Установка и Обновление агента newt](#установка-и-обновление-newt)
 
 ---
 
@@ -417,3 +418,51 @@ crontab -e
 /usr/local/bin/
 └── pangolin-update.sh                          # Скрипт
 ```
+
+
+
+## Установка и Обновление newt
+
+Создание файла службы:
+
+```bash
+sudo nano /etc/systemd/system/newt.service
+```
+
+Содержимое файла:
+
+```bash
+[Unit]
+Description=Newt Agent
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/newt --id 9***on --secret py5***qj66 --endpoint https://domain.tld
+Restart=always
+RestartSec=5
+User=root
+WorkingDirectory=/usr/local/bin
+
+# Optional hardening
+LimitNOFILE=65536
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+
+systemctl daemon-reload
+```
+
+Для обновления сначала необходимо остановить службу: `systemctl stop newt.service`
+
+Загрузите новый бинарный файл newt^
+
+```bash
+NEWT_V=$(curl -s https://api.github.com/repos/fosrl/newt/releases/latest | grep '"tag_name"' | cut -d '"' -f 4) \
+  && [ -n "$NEWT_V" ] \
+  && wget "https://github.com/fosrl/newt/releases/download/$NEWT_V/newt_linux_amd64" -O /usr/local/bin/newt \
+  && chmod +x /usr/local/bin/newt
+```
+
+Запустите службу: `systemctl start newt.service`
