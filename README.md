@@ -455,6 +455,11 @@ WantedBy=multi-user.target
 
 systemctl daemon-reload
 ```
+Обновите конфигурации служб
+
+```bash
+systemctl daemon-reload
+```
 
 Для обновления сначала необходимо остановить службу: `systemctl stop newt.service`
 
