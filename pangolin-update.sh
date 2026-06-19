@@ -1,6 +1,9 @@
 #!/bin/bash
-# ver. 0.3 (14.04.2026)
+# ver. 0.3.2 (19.06.2026)
 # Pangolin stack auto-updater with logging, health checks and rollback
+# 0.3.1: версия Traefik берётся с GitHub Releases (как остальные компоненты),
+#        с защитой от перехода на чужую мажорную ветку
+# 0.3.2: флаг -info — только сравнение версий (dry-run), без действий
 
 set -euo pipefail
 
@@ -20,6 +23,8 @@ RESTART_THRESHOLD=3     # порог количества перезапуско
 # Глобальные переменные (заполняются в процессе работы)
 DATE_SUFFIX=""
 ROLLBACK_DONE=false
+INFO_ONLY=false         # режим -info: только сравнение версий, без действий
+LOCK_HELD=false         # этот процесс владеет lock-файлом (для корректной очистки)
 
 # ─── Цвета для вывода в терминал ─────────────────────────────────────────────
 if [[ -t 1 ]]; then
@@ -70,7 +75,7 @@ rotate_log() {
 # ─── Очистка при выходе ───────────────────────────────────────────────────────
 cleanup() {
     local exit_code=$?
-    rm -f "${LOCK_FILE}"
+    [[ "${LOCK_HELD}" == true ]] && rm -f "${LOCK_FILE}"
     if (( exit_code != 0 )) && [[ "${ROLLBACK_DONE}" == false ]]; then
         log ERROR "Скрипт завершился с ошибкой (код: ${exit_code})"
     fi
@@ -103,6 +108,7 @@ acquire_lock() {
         fi
     fi
     echo $$ > "${LOCK_FILE}"
+    LOCK_HELD=true
 }
 
 # ─── Получение версии из GitHub Releases ─────────────────────────────────────
@@ -119,17 +125,32 @@ get_github_latest() {
     echo "${version}"
 }
 
-# ─── Получение последней стабильной версии Traefik из Docker Hub ─────────────
+# ─── Получение последней версии Traefik из GitHub Releases ───────────────────
+# Аргумент: текущая мажорная версия (например "3") — её нельзя пересекать,
+# чтобы не уйти на v2-патч или на разрушительный новый major.
 get_traefik_latest() {
+    local major="$1"
     local version
+
+    # Быстрый путь: последний релиз
     version=$(curl -sf --max-time 10 \
-        "https://registry.hub.docker.com/v2/repositories/library/traefik/tags?page_size=100" \
-        | jq -r '.results[].name' \
-        | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
-        | sort -V \
-        | tail -n1)
-    if [[ -z "${version}" ]]; then
-        log ERROR "Не удалось получить версию Traefik"
+        "https://api.github.com/repos/traefik/traefik/releases/latest" \
+        | jq -r '.tag_name')
+
+    # Если latest из другой мажорной ветки (напр. вышел патч v2.11.x) или
+    # ответ пустой/битый — берём последнюю стабильную версию строго в нашей ветке
+    if [[ -z "${version}" || "${version}" == "null" || "${version}" != v${major}.* ]]; then
+        log WARN "Traefik: latest вернул '${version}', ищу последнюю версию ветки v${major}"
+        version=$(curl -sf --max-time 10 \
+            "https://api.github.com/repos/traefik/traefik/releases?per_page=100" \
+            | jq -r '.[] | select(.prerelease==false and .draft==false) | .tag_name' \
+            | grep -E "^v${major}\.[0-9]+\.[0-9]+$" \
+            | sort -V \
+            | tail -n1)
+    fi
+
+    if [[ -z "${version}" || "${version}" == "null" ]]; then
+        log ERROR "Не удалось получить версию Traefik v${major}"
         exit 1
     fi
     echo "${version}"
@@ -339,15 +360,52 @@ do_rollback() {
     fi
 }
 
+# ─── Справка по использованию ────────────────────────────────────────────────
+usage() {
+    cat <<EOF
+Использование: $(basename "$0") [ОПЦИЯ]
+
+Без опций       Полный цикл: проверка версий и, при наличии обновлений,
+                обновление стека с health-check и автоматическим откатом.
+
+Опции:
+  -info, --info  Только проверка и вывод таблицы «Сравнение версий».
+                 Никаких действий не выполняется (dry-run): без резервных
+                 копий, остановки стека, изменения конфигов, скачивания
+                 и удаления образов.
+  -h, --help     Показать эту справку.
+EOF
+}
+
 # ════════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ════════════════════════════════════════════════════════════════════════════════
-rotate_log
-log_separator
-log INFO "Запуск проверки обновлений Pangolin-стека"
+
+# ─── Разбор аргументов ───────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -info|--info) INFO_ONLY=true; shift ;;
+        -h|--help)    usage; exit 0 ;;
+        *)            echo "Неизвестный аргумент: $1" >&2; usage >&2; exit 1 ;;
+    esac
+done
+
+if [[ "${INFO_ONLY}" == true ]]; then
+    log_separator
+    log INFO "Проверка версий Pangolin-стека (режим -info, изменения не вносятся)"
+else
+    rotate_log
+    log_separator
+    log INFO "Запуск проверки обновлений Pangolin-стека"
+fi
 
 check_deps
-acquire_lock
+
+# Lock нужен только для реального запуска: info-режим лишь читает данные,
+# не мешает идущему обновлению и не блокируется им.
+if [[ "${INFO_ONLY}" == false ]]; then
+    acquire_lock
+fi
 
 if [[ ! -f "${COMPOSE_FILE}" ]]; then
     log ERROR "Файл не найден: ${COMPOSE_FILE}"
@@ -358,11 +416,14 @@ fi
 log INFO "Чтение текущих версий из конфигурации..."
 read_current_versions
 
+# Определяем мажорную ветку Traefik из текущей версии (защита от перехода на v2/v4)
+TRAEFIK_MAJOR=$(echo "${OLD_TRAEFIK_V}" | sed -E 's/^v?([0-9]+).*/\1/')
+
 # Получаем актуальные версии
 log INFO "Запрос актуальных версий..."
 PANGOLIN_V=$(get_github_latest "fosrl/pangolin")
 GERBIL_V=$(get_github_latest "fosrl/gerbil")
-TRAEFIK_V=$(get_traefik_latest)
+TRAEFIK_V=$(get_traefik_latest "${TRAEFIK_MAJOR}")
 BADGER_V=$(get_github_latest "fosrl/badger")
 
 # Выводим таблицу версий
@@ -378,6 +439,12 @@ if [[ "${OLD_PANGOLIN_V}" == "${PANGOLIN_V}" &&
       "${OLD_TRAEFIK_V}"  == "${TRAEFIK_V}"  &&
       "${OLD_BADGER_V}"   == "${BADGER_V}" ]]; then
     log INFO "Все компоненты актуальны, обновление не требуется."
+    exit 0
+fi
+
+# Есть обновления. В режиме -info на этом и останавливаемся — без действий.
+if [[ "${INFO_ONLY}" == true ]]; then
+    log INFO "Доступно обновление. Режим -info: действия не выполняются."
     exit 0
 fi
 
