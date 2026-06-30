@@ -1,9 +1,11 @@
 #!/bin/bash
-# ver. 0.3.2 (19.06.2026)
+# ver. 0.3.3 (19.06.2026)
 # Pangolin stack auto-updater with logging, health checks and rollback
 # 0.3.1: версия Traefik берётся с GitHub Releases (как остальные компоненты),
 #        с защитой от перехода на чужую мажорную ветку
 # 0.3.2: флаг -info — только сравнение версий (dry-run), без действий
+# 0.3.3: флаги -enterprise/-community — переключение редакции Pangolin (CE/EE);
+#        текущая редакция определяется автоматически по тегу образа
 
 set -euo pipefail
 
@@ -25,6 +27,9 @@ DATE_SUFFIX=""
 ROLLBACK_DONE=false
 INFO_ONLY=false         # режим -info: только сравнение версий, без действий
 LOCK_HELD=false         # этот процесс владеет lock-файлом (для корректной очистки)
+EDITION_FLAG=""         # "" = авто (по образу), "ee" = форсировать Enterprise, "ce" = Community
+ENTERPRISE=false        # итоговая целевая редакция (вычисляется в MAIN)
+EDITION_SWITCH=false    # true, если редакция меняется относительно текущей
 
 # ─── Цвета для вывода в терминал ─────────────────────────────────────────────
 if [[ -t 1 ]]; then
@@ -123,6 +128,19 @@ get_github_latest() {
         exit 1
     fi
     echo "${version}"
+}
+
+# ─── Построение тега образа Pangolin под нужную редакцию ─────────────────────
+# Community Edition: тег = GitHub-релиз как есть (vX.Y.Z)
+# Enterprise Edition: тег = ee-X.Y.Z (тот же релиз, образ fosrl/pangolin:ee-*)
+# См. https://docs.pangolin.net/self-host/enterprise-edition
+pangolin_image_tag() {
+    local gh_tag="$1"   # напр. v1.14.1
+    if [[ "${ENTERPRISE}" == true ]]; then
+        echo "ee-${gh_tag#v}"
+    else
+        echo "${gh_tag}"
+    fi
 }
 
 # ─── Получение последней версии Traefik из GitHub Releases ───────────────────
@@ -369,11 +387,19 @@ usage() {
                 обновление стека с health-check и автоматическим откатом.
 
 Опции:
-  -info, --info  Только проверка и вывод таблицы «Сравнение версий».
-                 Никаких действий не выполняется (dry-run): без резервных
-                 копий, остановки стека, изменения конфигов, скачивания
-                 и удаления образов.
-  -h, --help     Показать эту справку.
+  -info, --info        Только проверка и вывод таблицы «Сравнение версий».
+                       Никаких действий не выполняется (dry-run): без резервных
+                       копий, остановки стека, изменения конфигов, скачивания
+                       и удаления образов.
+  -enterprise, --ee    Использовать/переключиться на Enterprise Edition
+                       (образ fosrl/pangolin:ee-*). Требует активации лицензии
+                       вручную в панели Server Admin (/admin/license).
+  -community, --ce     Использовать/вернуться на Community Edition
+                       (образ fosrl/pangolin:*).
+  -h, --help           Показать эту справку.
+
+Без флага редакции текущая редакция Pangolin определяется автоматически по
+тегу образа в docker-compose.yml и сохраняется (безопасно для cron).
 EOF
 }
 
@@ -384,9 +410,11 @@ EOF
 # ─── Разбор аргументов ───────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -info|--info) INFO_ONLY=true; shift ;;
-        -h|--help)    usage; exit 0 ;;
-        *)            echo "Неизвестный аргумент: $1" >&2; usage >&2; exit 1 ;;
+        -info|--info)             INFO_ONLY=true; shift ;;
+        -enterprise|--enterprise|--ee) EDITION_FLAG="ee"; shift ;;
+        -community|--community|--ce)   EDITION_FLAG="ce"; shift ;;
+        -h|--help)                usage; exit 0 ;;
+        *)                        echo "Неизвестный аргумент: $1" >&2; usage >&2; exit 1 ;;
     esac
 done
 
@@ -416,12 +444,40 @@ fi
 log INFO "Чтение текущих версий из конфигурации..."
 read_current_versions
 
+# ─── Определение редакции Pangolin (Community / Enterprise) ──────────────────
+# Текущая редакция — по тегу образа: ee-* => Enterprise, иначе Community.
+CURRENT_EDITION="ce"
+[[ "${OLD_PANGOLIN_V}" == ee-* ]] && CURRENT_EDITION="ee"
+
+# Целевая редакция: явный флаг важнее, иначе сохраняем текущую (безопасно для cron).
+case "${EDITION_FLAG}" in
+    ee) ENTERPRISE=true  ;;
+    ce) ENTERPRISE=false ;;
+    *)  [[ "${CURRENT_EDITION}" == "ee" ]] && ENTERPRISE=true || ENTERPRISE=false ;;
+esac
+
+if [[ "${ENTERPRISE}" == true ]]; then
+    log INFO "Редакция Pangolin: Enterprise (образ fosrl/pangolin:ee-*)"
+else
+    log INFO "Редакция Pangolin: Community (образ fosrl/pangolin:*)"
+fi
+
+# Фиксируем факт смены редакции (для предупреждений и напоминания о лицензии).
+if { [[ "${ENTERPRISE}" == true  ]] && [[ "${CURRENT_EDITION}" == "ce" ]]; } || \
+   { [[ "${ENTERPRISE}" == false ]] && [[ "${CURRENT_EDITION}" == "ee" ]]; }; then
+    EDITION_SWITCH=true
+    EDITION_TO=$([[ "${ENTERPRISE}" == true ]] && echo "Enterprise" || echo "Community")
+    log WARN "Смена редакции Pangolin: $([[ ${CURRENT_EDITION} == ee ]] && echo Enterprise || echo Community) -> ${EDITION_TO}"
+    log WARN "Перед сменой редакции рекомендуется сделать резервную копию БД (редакции используют общую схему, но это страховка)."
+fi
+
 # Определяем мажорную ветку Traefik из текущей версии (защита от перехода на v2/v4)
 TRAEFIK_MAJOR=$(echo "${OLD_TRAEFIK_V}" | sed -E 's/^v?([0-9]+).*/\1/')
 
 # Получаем актуальные версии
 log INFO "Запрос актуальных версий..."
-PANGOLIN_V=$(get_github_latest "fosrl/pangolin")
+PANGOLIN_GH_V=$(get_github_latest "fosrl/pangolin")     # GitHub-релиз (vX.Y.Z)
+PANGOLIN_V=$(pangolin_image_tag "${PANGOLIN_GH_V}")     # тег образа нужной редакции
 GERBIL_V=$(get_github_latest "fosrl/gerbil")
 TRAEFIK_V=$(get_traefik_latest "${TRAEFIK_MAJOR}")
 BADGER_V=$(get_github_latest "fosrl/badger")
@@ -471,7 +527,23 @@ log OK "Файлы конфигурации обновлены"
 
 # Скачиваем новые образы
 log INFO "Скачивание новых Docker-образов..."
+set +e
 docker compose pull >> "${LOG_FILE}" 2>&1
+PULL_RESULT=$?
+set -e
+if (( PULL_RESULT != 0 )); then
+    log ERROR "Не удалось скачать образы (проверьте, что тег '${PANGOLIN_V}' существует) — запускаем откат"
+    set +e
+    do_rollback
+    ROLLBACK_RESULT=$?
+    set -e
+    if (( ROLLBACK_RESULT != 0 )); then
+        log ERROR "КРИТИЧНО: откат после неудачного pull завершился с ошибкой."
+        log ERROR "Резервные копии конфигураций: *.bak.${DATE_SUFFIX}"
+        exit 2
+    fi
+    exit 1
+fi
 log OK "Образы скачаны"
 
 # Запускаем стек с новыми версиями
@@ -509,4 +581,11 @@ docker image prune -a -f >> "${LOG_FILE}" 2>&1
 log OK "Устаревшие образы удалены"
 
 log OK "Обновление успешно завершено"
+
+# Напоминание об активации лицензии при переходе на Enterprise Edition
+if [[ "${EDITION_SWITCH}" == true && "${ENTERPRISE}" == true ]]; then
+    log INFO "Переключено на Enterprise Edition. Активируйте лицензионный ключ"
+    log INFO "в панели Server Admin: /admin/license (без ключа EE-функции останутся выключенными)."
+fi
+
 log_separator
