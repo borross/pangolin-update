@@ -1,11 +1,12 @@
 #!/bin/bash
-# ver. 0.3.3 (19.06.2026)
+# ver. 0.3.4 (19.06.2026)
 # Pangolin stack auto-updater with logging, health checks and rollback
 # 0.3.1: версия Traefik берётся с GitHub Releases (как остальные компоненты),
 #        с защитой от перехода на чужую мажорную ветку
 # 0.3.2: флаг -info — только сравнение версий (dry-run), без действий
 # 0.3.3: флаги -enterprise/-community — переключение редакции Pangolin (CE/EE);
 #        текущая редакция определяется автоматически по тегу образа
+# 0.3.4: чтение и запись версии badger теперь работают и без кавычек в YAML
 
 set -euo pipefail
 
@@ -180,7 +181,7 @@ read_current_versions() {
     OLD_GERBIL_V=$(grep "image: docker.io/fosrl/gerbil"    "${COMPOSE_FILE}" | cut -d: -f3)
     OLD_TRAEFIK_V=$(grep "image: docker.io/traefik"        "${COMPOSE_FILE}" | cut -d: -f3)
     OLD_BADGER_V=$(grep -A5 '^[[:space:]]*badger:' "${TRAEFIK_CONFIG}" \
-        | awk -F'"' '/version:/ { print $2 }')
+        | awk '/version:/ { v=$2; gsub(/"/, "", v); print v; exit }')
 
     for var in OLD_PANGOLIN_V OLD_GERBIL_V OLD_TRAEFIK_V OLD_BADGER_V; do
         if [[ -z "${!var}" ]]; then
@@ -522,7 +523,7 @@ log INFO "Обновление версий в конфигурационных 
 sed -i -E "s|(docker.io/fosrl/pangolin:)[^[:space:]]+|\1${PANGOLIN_V}|" "${COMPOSE_FILE}"
 sed -i -E "s|(docker.io/fosrl/gerbil:)[^[:space:]]+|\1${GERBIL_V}|"    "${COMPOSE_FILE}"
 sed -i -E "s|(docker.io/traefik:)[^[:space:]]+|\1${TRAEFIK_V}|"        "${COMPOSE_FILE}"
-sed -i -E "s|(\s*version:)\s*\"[^\"]+\"|\1 \"${BADGER_V}\"|"           "${TRAEFIK_CONFIG}"
+sed -i -E "s|^([[:space:]]*version:[[:space:]]*)(\"?)[^\"[:space:]]+(\"?)|\1\2${BADGER_V}\3|" "${TRAEFIK_CONFIG}"
 log OK "Файлы конфигурации обновлены"
 
 # Скачиваем новые образы
