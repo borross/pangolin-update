@@ -1,5 +1,5 @@
 #!/bin/bash
-# ver. 0.3.4 (19.06.2026)
+# ver. 0.5 (19.07.2026)
 # Pangolin stack auto-updater with logging, health checks and rollback
 # 0.3.1: версия Traefik берётся с GitHub Releases (как остальные компоненты),
 #        с защитой от перехода на чужую мажорную ветку
@@ -7,6 +7,11 @@
 # 0.3.3: флаги -enterprise/-community — переключение редакции Pangolin (CE/EE);
 #        текущая редакция определяется автоматически по тегу образа
 # 0.3.4: чтение и запись версии badger теперь работают и без кавычек в YAML
+# 0.4:   -backup/-restore — полное резервное копирование (конфиги+БД+сертификаты)
+#        и восстановление из архива; автоматический полный бэкап перед обновлением
+# 0.5:   интеграция с Cloudflare: -cloudflare включает автоматическое создание
+#        DNS-записей в Cloudflare для новых поддоменов (ресурсов) Pangolin —
+#        синхронизация -dns-sync по cron; -cloudflare-off отключает интеграцию
 
 set -euo pipefail
 
@@ -23,6 +28,14 @@ HEALTH_INTERVAL=10      # интервал между повторными пр�
 HEALTH_RETRIES=6        # количество попыток проверки
 RESTART_THRESHOLD=3     # порог количества перезапусков контейнера (аномалия)
 
+BACKUP_DIR="/root/pangolin-backups"  # каталог полных резервных копий (tar.gz)
+BACKUP_KEEP=7                        # сколько последних архивов хранить
+
+CF_ENV_FILE="${PANGOLIN_DIR}/.cf-dns.env"    # настройки интеграции с Cloudflare (токен, IP)
+CF_CRON_FILE="/etc/cron.d/pangolin-cf-dns"   # cron-задача автосинхронизации DNS
+CF_SYNC_INTERVAL=5                           # период синхронизации DNS-записей (минуты)
+CF_API="https://api.cloudflare.com/client/v4"
+
 # Глобальные переменные (заполняются в процессе работы)
 DATE_SUFFIX=""
 ROLLBACK_DONE=false
@@ -31,6 +44,9 @@ LOCK_HELD=false         # этот процесс владеет lock-файло
 EDITION_FLAG=""         # "" = авто (по образу), "ee" = форсировать Enterprise, "ce" = Community
 ENTERPRISE=false        # итоговая целевая редакция (вычисляется в MAIN)
 EDITION_SWITCH=false    # true, если редакция меняется относительно текущей
+ACTION=""               # сервисное действие: backup | restore | cf_on | cf_off
+RESTORE_FILE=""         # путь к архиву для -restore (пусто = последний)
+CF_TOKEN=""             # API-токен Cloudflare, переданный аргументом -cloudflare
 
 # ─── Цвета для вывода в терминал ─────────────────────────────────────────────
 if [[ -t 1 ]]; then
@@ -91,7 +107,7 @@ trap cleanup EXIT
 # ─── Проверка зависимостей ────────────────────────────────────────────────────
 check_deps() {
     local missing=()
-    for cmd in curl jq docker sed awk; do
+    for cmd in curl jq docker sed awk tar; do
         command -v "${cmd}" &>/dev/null || missing+=("${cmd}")
     done
     if (( ${#missing[@]} > 0 )); then
@@ -379,6 +395,332 @@ do_rollback() {
     fi
 }
 
+# ─── Полная резервная копия: конфиги + БД + сертификаты ──────────────────────
+# Вызывается при остановленном стеке — так копия SQLite-базы консистентна.
+# ponytail: холодный бэкап (короткий downtime); горячий через sqlite3 .backup —
+# если простой станет неприемлем.
+create_backup_archive() {
+    mkdir -p "${BACKUP_DIR}"
+    local archive="${BACKUP_DIR}/pangolin_$(date +%d%m%Y_%H%M%S).tar.gz"
+
+    log INFO "Архивирование ${PANGOLIN_DIR} (docker-compose.yml + config/)..."
+    tar czf "${archive}" --exclude='*.bak.*' -C "${PANGOLIN_DIR}" docker-compose.yml config
+    log OK "Резервная копия создана: ${archive} ($(du -h "${archive}" | cut -f1))"
+
+    # Храним только последние BACKUP_KEEP архивов
+    local old
+    old=$(ls -1t "${BACKUP_DIR}"/pangolin_*.tar.gz 2>/dev/null | tail -n +$((BACKUP_KEEP + 1)) || true)
+    if [[ -n "${old}" ]]; then
+        echo "${old}" | xargs rm -f
+        log INFO "Старые архивы удалены (храним последние ${BACKUP_KEEP})"
+    fi
+}
+
+# ─── Режим -backup: остановить стек, снять копию, запустить обратно ──────────
+do_backup() {
+    log INFO "Создание полной резервной копии стека (конфигурация, БД, сертификаты)"
+    log INFO "Остановка Docker-стека (для консистентной копии БД)..."
+    docker compose down >> "${LOG_FILE}" 2>&1
+    log OK "Стек остановлен"
+
+    create_backup_archive
+
+    log INFO "Запуск Docker-стека..."
+    docker compose up -d >> "${LOG_FILE}" 2>&1
+    log OK "Стек запущен"
+    log_separator
+    exit 0
+}
+
+# ─── Режим -restore: восстановление из архива ────────────────────────────────
+do_restore() {
+    local archive="${1:-}"
+
+    if [[ -z "${archive}" ]]; then
+        archive=$(ls -1t "${BACKUP_DIR}"/pangolin_*.tar.gz 2>/dev/null | head -n1 || true)
+        if [[ -z "${archive}" ]]; then
+            log ERROR "Резервные копии не найдены в ${BACKUP_DIR}"
+            exit 1
+        fi
+        log INFO "Архив не указан — использую последний: ${archive}"
+    fi
+
+    if [[ ! -f "${archive}" ]]; then
+        log ERROR "Файл не найден: ${archive}"
+        exit 1
+    fi
+    if ! tar tzf "${archive}" >/dev/null 2>&1; then
+        log ERROR "Архив повреждён или не является tar.gz: ${archive}"
+        exit 1
+    fi
+
+    log WARN "Восстановление из резервной копии: ${archive}"
+    log WARN "Текущие конфигурация, БД и сертификаты будут перезаписаны содержимым архива"
+
+    log INFO "Остановка Docker-стека..."
+    docker compose down >> "${LOG_FILE}" 2>&1 || true
+    log OK "Стек остановлен"
+
+    mkdir -p "${PANGOLIN_DIR}"
+    tar xzf "${archive}" -C "${PANGOLIN_DIR}"
+    log OK "Файлы восстановлены из архива"
+
+    # Образы версий из архива могли быть удалены prune — докачиваем недостающие
+    log INFO "Скачивание образов (если отсутствуют в локальном кэше)..."
+    docker compose pull >> "${LOG_FILE}" 2>&1 \
+        || log WARN "docker compose pull завершился с ошибкой — пробуем запустить из кэша"
+
+    log INFO "Запуск Docker-стека..."
+    docker compose up -d >> "${LOG_FILE}" 2>&1
+
+    set +e
+    health_check
+    local hc=$?
+    set -e
+    if (( hc != 0 )); then
+        log ERROR "Стек восстановлен из архива, но не прошёл health check — смотрите логи выше"
+        exit 1
+    fi
+
+    log OK "Восстановление из резервной копии выполнено успешно"
+    log_separator
+    exit 0
+}
+
+# ─── Интеграция с Cloudflare: автосоздание DNS-записей для поддоменов ────────
+# При появлении нового ресурса (поддомена) в Pangolin для него автоматически
+# создаётся A-запись в Cloudflare. Список поддоменов берётся из конфигурации,
+# которую Pangolin отдаёт Traefik (endpoint /api/v1/traefik-config) — там
+# перечислены Host-правила всех ресурсов.
+# -cloudflare сохраняет настройки в CF_ENV_FILE и ставит cron-задачу -dns-sync;
+# -cloudflare-off убирает и то и другое. Docker-стек при этом не перезапускается.
+
+cf_api() {
+    curl -sf --max-time 15 \
+        -H "Authorization: Bearer ${CF_TOKEN}" \
+        -H "Content-Type: application/json" "$@"
+}
+
+# Поиск зоны Cloudflare для FQDN: отбрасываем метки слева, пока не найдём зону.
+# Результат — в глобальных ZONE_ID / ZONE_NAME (вызов без subshell, чтобы
+# кэш CF_ZONE_CACHE сохранялся между итерациями). Возвращает 0/1.
+declare -A CF_ZONE_CACHE
+ZONE_ID=""
+ZONE_NAME=""
+cf_find_zone() {
+    local candidate="$1" zid
+    ZONE_ID=""; ZONE_NAME=""
+    while [[ "${candidate}" == *.* ]]; do
+        if [[ -n "${CF_ZONE_CACHE[${candidate}]:-}" ]]; then
+            ZONE_ID="${CF_ZONE_CACHE[${candidate}]}"
+            ZONE_NAME="${candidate}"
+            return 0
+        fi
+        zid=$(cf_api "${CF_API}/zones?name=${candidate}&status=active" \
+            | jq -r '.result[0].id // empty')
+        if [[ -n "${zid}" ]]; then
+            CF_ZONE_CACHE[${candidate}]="${zid}"
+            ZONE_ID="${zid}"
+            ZONE_NAME="${candidate}"
+            return 0
+        fi
+        candidate="${candidate#*.}"
+    done
+    return 1
+}
+
+# Список FQDN всех ресурсов Pangolin — из HTTP-конфигурации для Traefik
+get_pangolin_hostnames() {
+    local cid ip cfg
+    cid=$(docker compose ps -q pangolin 2>/dev/null || true)
+    if [[ -z "${cid}" ]]; then
+        log ERROR "[DNS] Контейнер pangolin не запущен — не могу получить список поддоменов"
+        return 1
+    fi
+    ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${cid}")
+    cfg=$(curl -sf --max-time 10 "http://${ip}:3001/api/v1/traefik-config") || {
+        log ERROR "[DNS] Не удалось получить http://${ip}:3001/api/v1/traefik-config"
+        return 1
+    }
+    echo "${cfg}" | grep -oE 'Host\(`[^`]+`\)' | sed -E 's/^Host\(`//; s/`\)$//' | sort -u || true
+}
+
+# ─── Ядро синхронизации DNS ──────────────────────────────────────────────────
+# Использует CF_TOKEN, CF_TARGET_IP, CF_PROXIED. Возвращает 0 или 1 (были ошибки).
+# Добавляет только недостающие записи; существующие (любого типа) не трогает.
+dns_sync_run() {
+    local hostnames
+    hostnames=$(get_pangolin_hostnames) || return 1
+    [[ -z "${hostnames}" ]] && return 0   # ресурсов нет — делать нечего
+
+    local created=0 skipped=0 external=0 failed=0
+    local fqdn rec ok verbose=false
+    [[ -t 1 ]] && verbose=true   # ручной запуск — подробный вывод; cron — тихий
+
+    while IFS= read -r fqdn; do
+        [[ -z "${fqdn}" ]] && continue
+
+        if ! cf_find_zone "${fqdn}"; then
+            # Домен обслуживается не в Cloudflare — это не ошибка, просто пропускаем.
+            # Пишем в лог только при ручном запуске, чтобы не засорять его из cron.
+            [[ "${verbose}" == true ]] && log WARN "[DNS] Зона для '${fqdn}' не найдена в Cloudflare — пропускаю"
+            (( external++ )) || true
+            continue
+        fi
+
+        rec=$(cf_api "${CF_API}/zones/${ZONE_ID}/dns_records?name=${fqdn}" \
+            | jq -r '.result[0].id // empty')
+        if [[ -n "${rec}" ]]; then
+            (( skipped++ )) || true
+            continue
+        fi
+
+        ok=$(cf_api -X POST "${CF_API}/zones/${ZONE_ID}/dns_records" --data "{
+                \"type\": \"A\",
+                \"name\": \"${fqdn}\",
+                \"content\": \"${CF_TARGET_IP}\",
+                \"ttl\": 1,
+                \"proxied\": ${CF_PROXIED:-false},
+                \"comment\": \"pangolin-update autosync\"
+            }" | jq -r '.success' || true)
+        if [[ "${ok}" == "true" ]]; then
+            log OK "[DNS] Создана A-запись: ${fqdn} -> ${CF_TARGET_IP} (зона ${ZONE_NAME}, proxied=${CF_PROXIED:-false})"
+            (( created++ )) || true
+        else
+            log ERROR "[DNS] Не удалось создать запись '${fqdn}' — проверьте права токена (Zone:Read, DNS:Edit) для зоны ${ZONE_NAME}"
+            (( failed++ )) || true
+        fi
+    done <<< "${hostnames}"
+
+    # Из cron запуск тихий: итог пишем только когда что-то создали или были ошибки.
+    # При ручном запуске итог выводится всегда.
+    if (( created > 0 || failed > 0 )) || [[ "${verbose}" == true ]]; then
+        log INFO "[DNS] Синхронизация: создано ${created}, уже существует ${skipped}, вне Cloudflare ${external}, ошибок ${failed}"
+    fi
+    (( failed > 0 )) && return 1
+    return 0
+}
+
+# ─── Режим -dns-sync: разовая синхронизация (вызывается из cron) ─────────────
+do_dns_sync() {
+    if [[ ! -f "${CF_ENV_FILE}" ]]; then
+        log ERROR "Интеграция с Cloudflare не включена (нет файла ${CF_ENV_FILE})."
+        log ERROR "Включите: $(basename "$0") -cloudflare <TOKEN>"
+        exit 1
+    fi
+    # shellcheck source=/dev/null
+    source "${CF_ENV_FILE}"
+    if [[ -z "${CF_TOKEN:-}" || -z "${CF_TARGET_IP:-}" ]]; then
+        log ERROR "В ${CF_ENV_FILE} не заданы CF_TOKEN и/или CF_TARGET_IP"
+        exit 1
+    fi
+
+    # Идёт обновление/бэкап (главный lock занят) — тихо откладываем до следующего цикла
+    if [[ -f "${LOCK_FILE}" ]] && kill -0 "$(cat "${LOCK_FILE}" 2>/dev/null)" 2>/dev/null; then
+        exit 0
+    fi
+
+    dns_sync_run && exit 0 || exit 1
+}
+
+# ─── Включение интеграции с Cloudflare ───────────────────────────────────────
+cf_enable() {
+    local token="${1:-${CLOUDFLARE_API_TOKEN:-${CLOUDFLARE_DNS_API_TOKEN:-}}}"
+
+    # Токен не передан, но интеграция уже была включена — берём сохранённый
+    if [[ -z "${token}" && -f "${CF_ENV_FILE}" ]]; then
+        # shellcheck source=/dev/null
+        source "${CF_ENV_FILE}"
+        token="${CF_TOKEN:-}"
+    fi
+    if [[ -z "${token}" ]]; then
+        log ERROR "Не указан API-токен Cloudflare."
+        log ERROR "Передайте его аргументом:  $(basename "$0") -cloudflare <TOKEN>"
+        log ERROR "или через переменную окружения CLOUDFLARE_API_TOKEN."
+        log ERROR "Токен создаётся в dash.cloudflare.com -> My Profile -> API Tokens"
+        log ERROR "с правами Zone:Read и DNS:Edit для зоны вашего домена."
+        exit 1
+    fi
+
+    log INFO "Включение интеграции с Cloudflare (автосоздание DNS-записей для поддоменов)"
+
+    # Проверка токена
+    CF_TOKEN="${token}"
+    if [[ "$(cf_api "${CF_API}/user/tokens/verify" | jq -r '.success' || true)" != "true" ]]; then
+        log ERROR "Токен Cloudflare не прошёл проверку (${CF_API}/user/tokens/verify)"
+        exit 1
+    fi
+    log OK "Токен Cloudflare действителен"
+
+    # Публичный IP сервера — на него будут указывать создаваемые A-записи
+    CF_TARGET_IP=$(curl -4 -sf --max-time 10 https://api.ipify.org \
+        || curl -4 -sf --max-time 10 https://ifconfig.me || true)
+    if [[ -z "${CF_TARGET_IP}" ]]; then
+        log ERROR "Не удалось определить публичный IP сервера."
+        log ERROR "Проверьте доступ в интернет и повторите, либо создайте ${CF_ENV_FILE} вручную."
+        exit 1
+    fi
+    log INFO "Публичный IP сервера: ${CF_TARGET_IP} (при необходимости измените в ${CF_ENV_FILE})"
+
+    # Файл настроек (только для root)
+    umask 077
+    cat > "${CF_ENV_FILE}" <<EOF
+# Интеграция pangolin-update с Cloudflare DNS (создано $(date '+%Y-%m-%d %H:%M:%S'))
+CF_TOKEN="${token}"
+CF_TARGET_IP="${CF_TARGET_IP}"
+CF_PROXIED=${CF_PROXIED:-false}   # true = проксировать записи через Cloudflare (оранжевое облако)
+EOF
+    log OK "Настройки сохранены: ${CF_ENV_FILE} (права 600)"
+
+    # cron-задача периодической синхронизации
+    local script_path
+    script_path=$(readlink -f "$0")
+    cat > "${CF_CRON_FILE}" <<EOF
+# Автосинхронизация DNS-записей Cloudflare с ресурсами Pangolin (pangolin-update)
+*/${CF_SYNC_INTERVAL} * * * * root ${script_path} -dns-sync >/dev/null 2>&1
+EOF
+    chmod 644 "${CF_CRON_FILE}"
+    log OK "cron-задача создана: ${CF_CRON_FILE} (каждые ${CF_SYNC_INTERVAL} мин)"
+
+    # Первичная синхронизация — сразу создаём записи для существующих ресурсов
+    log INFO "Первичная синхронизация DNS-записей..."
+    CF_PROXIED="${CF_PROXIED:-false}"
+    if dns_sync_run; then
+        log OK "Интеграция с Cloudflare включена. Новые поддомены Pangolin будут"
+        log OK "получать A-записи автоматически (проверка каждые ${CF_SYNC_INTERVAL} мин)."
+    else
+        log WARN "Интеграция включена, но при первичной синхронизации были ошибки — см. лог выше"
+    fi
+    log_separator
+    exit 0
+}
+
+# ─── Отключение интеграции с Cloudflare ──────────────────────────────────────
+cf_disable() {
+    local removed=false
+
+    if [[ -f "${CF_CRON_FILE}" ]]; then
+        rm -f "${CF_CRON_FILE}"
+        log OK "cron-задача удалена: ${CF_CRON_FILE}"
+        removed=true
+    fi
+    if [[ -f "${CF_ENV_FILE}" ]]; then
+        rm -f "${CF_ENV_FILE}"
+        log OK "Файл настроек удалён: ${CF_ENV_FILE}"
+        removed=true
+    fi
+
+    if [[ "${removed}" == true ]]; then
+        log OK "Интеграция с Cloudflare отключена — новые поддомены больше не синхронизируются"
+        log INFO "Уже созданные DNS-записи в Cloudflare сохранены. При необходимости удалите их"
+        log INFO "вручную — они помечены комментарием 'pangolin-update autosync'."
+    else
+        log INFO "Интеграция с Cloudflare не была включена. Ничего не меняю."
+    fi
+    log_separator
+    exit 0
+}
+
 # ─── Справка по использованию ────────────────────────────────────────────────
 usage() {
     cat <<EOF
@@ -397,6 +739,25 @@ usage() {
                        вручную в панели Server Admin (/admin/license).
   -community, --ce     Использовать/вернуться на Community Edition
                        (образ fosrl/pangolin:*).
+  -backup, --backup    Полная резервная копия стека (docker-compose.yml + config/:
+                       БД, сертификаты, конфиги Traefik) в tar.gz-архив.
+                       Стек кратко останавливается для консистентной копии БД.
+  -restore [файл], --restore [файл]
+                       Восстановление из архива. Без аргумента берётся самый
+                       свежий архив из каталога резервных копий.
+  -cloudflare [токен], --cf [токен]
+                       Включить интеграцию с Cloudflare: автоматическое создание
+                       A-записей в Cloudflare DNS для новых поддоменов (ресурсов)
+                       Pangolin. Ставит cron-задачу синхронизации (-dns-sync).
+                       Токен — аргументом или через переменную окружения
+                       CLOUDFLARE_API_TOKEN (права Zone:Read + DNS:Edit).
+  -cloudflare-off, --cf-off
+                       Отключить интеграцию: убрать cron-задачу и файл настроек.
+                       Уже созданные DNS-записи не удаляются.
+  -dns-sync, --dns-sync
+                       Разовая синхронизация DNS-записей (вызывается из cron,
+                       можно запускать вручную). Добавляет только недостающие
+                       записи, существующие не трогает.
   -h, --help           Показать эту справку.
 
 Без флага редакции текущая редакция Pangolin определяется автоматически по
@@ -414,6 +775,17 @@ while [[ $# -gt 0 ]]; do
         -info|--info)             INFO_ONLY=true; shift ;;
         -enterprise|--enterprise|--ee) EDITION_FLAG="ee"; shift ;;
         -community|--community|--ce)   EDITION_FLAG="ce"; shift ;;
+        -backup|--backup)         ACTION="backup"; shift ;;
+        -restore|--restore)
+            ACTION="restore"
+            if [[ $# -gt 1 && "${2}" != -* ]]; then RESTORE_FILE="$2"; shift; fi
+            shift ;;
+        -cloudflare|--cloudflare|--cf)
+            ACTION="cf_on"
+            if [[ $# -gt 1 && "${2}" != -* ]]; then CF_TOKEN="$2"; shift; fi
+            shift ;;
+        -cloudflare-off|--cloudflare-off|--cf-off) ACTION="cf_off"; shift ;;
+        -dns-sync|--dns-sync)     ACTION="dns_sync"; shift ;;
         -h|--help)                usage; exit 0 ;;
         *)                        echo "Неизвестный аргумент: $1" >&2; usage >&2; exit 1 ;;
     esac
@@ -422,6 +794,12 @@ done
 if [[ "${INFO_ONLY}" == true ]]; then
     log_separator
     log INFO "Проверка версий Pangolin-стека (режим -info, изменения не вносятся)"
+elif [[ "${ACTION}" == "dns_sync" ]]; then
+    # Частый тихий запуск из cron: без разделителя, ротация лога сохраняется
+    rotate_log
+elif [[ -n "${ACTION}" ]]; then
+    rotate_log
+    log_separator
 else
     rotate_log
     log_separator
@@ -430,15 +808,32 @@ fi
 
 check_deps
 
-# Lock нужен только для реального запуска: info-режим лишь читает данные,
-# не мешает идущему обновлению и не блокируется им.
-if [[ "${INFO_ONLY}" == false ]]; then
+# Lock нужен только для запусков, меняющих стек. Режимы -info и -dns-sync лишь
+# читают данные: они не мешают идущему обновлению и не блокируются им
+# (-dns-sync сам тихо откладывается, если главный lock занят).
+if [[ "${INFO_ONLY}" == false && "${ACTION}" != "dns_sync" ]]; then
     acquire_lock
 fi
 
-if [[ ! -f "${COMPOSE_FILE}" ]]; then
+# При restore compose-файл может отсутствовать (разрушенная установка) —
+# он будет восстановлен из архива.
+if [[ ! -f "${COMPOSE_FILE}" && "${ACTION}" != "restore" ]]; then
     log ERROR "Файл не найден: ${COMPOSE_FILE}"
     exit 1
+fi
+
+# ─── Сервисные действия: backup / restore / cloudflare ───────────────────────
+# Каждая функция завершает работу самостоятельно (exit).
+if [[ -n "${ACTION}" ]]; then
+    mkdir -p "${PANGOLIN_DIR}"
+    cd "${PANGOLIN_DIR}"
+    case "${ACTION}" in
+        backup)   do_backup ;;
+        restore)  do_restore "${RESTORE_FILE}" ;;
+        cf_on)    cf_enable "${CF_TOKEN}" ;;
+        cf_off)   cf_disable ;;
+        dns_sync) do_dns_sync ;;
+    esac
 fi
 
 # Получаем текущие версии
@@ -517,6 +912,9 @@ log INFO "Остановка Docker-стека..."
 cd "${PANGOLIN_DIR}"
 docker compose down >> "${LOG_FILE}" 2>&1
 log OK "Стек остановлен"
+
+# Полная резервная копия перед обновлением (стек остановлен — БД консистентна)
+create_backup_archive
 
 # Обновляем версии в файлах
 log INFO "Обновление версий в конфигурационных файлах..."
