@@ -1,5 +1,5 @@
 #!/bin/bash
-# ver. 0.5 (19.07.2026)
+# ver. 0.6 (26.10.2026)
 # Pangolin stack auto-updater with logging, health checks and rollback
 # 0.3.1: версия Traefik берётся с GitHub Releases (как остальные компоненты),
 #        с защитой от перехода на чужую мажорную ветку
@@ -12,6 +12,16 @@
 # 0.5:   интеграция с Cloudflare: -cloudflare включает автоматическое создание
 #        DNS-записей в Cloudflare для новых поддоменов (ресурсов) Pangolin —
 #        синхронизация -dns-sync по cron; -cloudflare-off отключает интеграцию
+# 0.6:   защита от «тихого» отказа плагина Badger (Traefik жив, но плагин
+#        отключён — все ресурсы недоступны):
+#        - проба новой пары Traefik+Badger в одноразовом контейнере ДО обновления;
+#          не прошедший пробу компонент не обновляется, остальные — обновляются;
+#        - health check читает логи Traefik на ошибки загрузки плагинов;
+#        - частичный откат только версии Badger (без отката всего стека);
+#        - контроль версии Badger, которую меняет миграция Pangolin при старте;
+#        - BADGER_PIN — закрепление версии Badger;
+#        - чтение/запись версии только внутри блока badger: (раньше sed менял
+#          любую строку version: в traefik_config.yml)
 
 set -euo pipefail
 
@@ -36,6 +46,14 @@ CF_CRON_FILE="/etc/cron.d/pangolin-cf-dns"   # cron-задача автосин�
 CF_SYNC_INTERVAL=5                           # период синхронизации DNS-записей (минуты)
 CF_API="https://api.cloudflare.com/client/v4"
 
+BADGER_MODULE="github.com/fosrl/badger"
+BADGER_PIN=""           # закрепить версию Badger (напр. "v1.7.0"); пусто = следовать за релизами
+BADGER_PROBE=true       # проверять новую пару Traefik+Badger в тестовом контейнере до обновления
+BADGER_PROBE_WAIT=30    # сколько секунд тестовый Traefik ждёт ошибку загрузки плагина
+
+# Сообщения Traefik, означающие, что плагины не загрузились
+TRAEFIK_PLUGIN_ERR_RE='Plugins are disabled|unable to set up plugins|unable to download plugin|invalid hash|failed to (get|download|load|check) plugin|middleware "[^"]*badger[^"]*" does not exist'
+
 # Глобальные переменные (заполняются в процессе работы)
 DATE_SUFFIX=""
 ROLLBACK_DONE=false
@@ -47,6 +65,8 @@ EDITION_SWITCH=false    # true, если редакция меняется от�
 ACTION=""               # сервисное действие: backup | restore | cf_on | cf_off
 RESTORE_FILE=""         # путь к архиву для -restore (пусто = последний)
 CF_TOKEN=""             # API-токен Cloudflare, переданный аргументом -cloudflare
+STACK_STARTED_AT=""     # момент (UTC, RFC3339) запуска стека/Traefik — для чтения свежих логов
+BADGER_HELD_BACK=false  # true, если новую версию Badger пришлось оставить на прежней
 
 # ─── Цвета для вывода в терминал ─────────────────────────────────────────────
 if [[ -t 1 ]]; then
@@ -191,13 +211,152 @@ get_traefik_latest() {
     echo "${version}"
 }
 
+# ─── Версия Badger: чтение и запись строго внутри блока badger: ──────────────
+# Структура traefik_config.yml (Pangolin):
+#   experimental:
+#     plugins:
+#       badger:
+#         moduleName: "github.com/fosrl/badger"
+#         version: "v1.7.0"
+get_badger_version() {
+    awk '
+        function indent(s) { match(s, /^[ ]*/); return RLENGTH }
+        inb && NF && indent($0) <= bind { inb = 0 }
+        inb && $1 == "version:" { v = $2; gsub(/["\047]/, "", v); print v; exit }
+        /^[ ]*badger:[ ]*$/ { inb = 1; bind = indent($0) }
+    ' "${TRAEFIK_CONFIG}"
+}
+
+set_badger_version() {
+    local ver="$1" tmp
+    tmp=$(mktemp) || return 1
+    if ! awk -v ver="${ver}" '
+        function indent(s) { match(s, /^[ ]*/); return RLENGTH }
+        inb && NF && indent($0) <= bind { inb = 0 }
+        inb && $1 == "version:" {
+            q = ($0 ~ /version:[ ]*"/) ? "\"" : ""
+            match($0, /^[ ]*version:[ ]*/)
+            print substr($0, 1, RLENGTH) q ver q
+            done = 1; inb = 0; next
+        }
+        /^[ ]*badger:[ ]*$/ { inb = 1; bind = indent($0) }
+        { print }
+        END { exit done ? 0 : 1 }
+    ' "${TRAEFIK_CONFIG}" > "${tmp}"; then
+        rm -f "${tmp}"
+        log ERROR "Не найден ключ version в блоке badger: файла ${TRAEFIK_CONFIG}"
+        return 1
+    fi
+    # cat вместо mv — сохраняем inode и права (файл примонтирован в контейнер)
+    cat "${tmp}" > "${TRAEFIK_CONFIG}"
+    rm -f "${tmp}"
+}
+
+# ─── Проба: загрузит ли Traefik указанную версию Badger ──────────────────────
+# Поднимает одноразовый контейнер Traefik (без портов, без конфигов стека) с
+# одним плагином. Traefik сам скачивает плагин из каталога plugins.traefik.io и
+# проходит ту же проверку целостности, что и боевой. Работающий стек не трогается.
+# Возвращает: 0 — плагин загрузился, 1 — ошибка (или пробу выполнить не удалось).
+probe_badger() {
+    local traefik_tag="$1" badger_ver="$2"
+    local name="pangolin-badger-probe-$$" logs="" state bad
+
+    log INFO "[Проба] Badger ${badger_ver} в Traefik ${traefik_tag} (тестовый контейнер, до ${BADGER_PROBE_WAIT}с)..."
+
+    if ! docker pull -q "docker.io/traefik:${traefik_tag}" >> "${LOG_FILE}" 2>&1; then
+        log WARN "[Проба] Не удалось скачать образ traefik:${traefik_tag}"
+        return 1
+    fi
+
+    docker rm -f "${name}" >/dev/null 2>&1 || true
+    if ! docker run -d --name "${name}" "docker.io/traefik:${traefik_tag}" \
+            --log.level=INFO \
+            --experimental.plugins.badger.modulename="${BADGER_MODULE}" \
+            --experimental.plugins.badger.version="${badger_ver}" \
+            >/dev/null 2>>"${LOG_FILE}"; then
+        log WARN "[Проба] Не удалось запустить тестовый контейнер Traefik"
+        return 1
+    fi
+
+    local waited=0
+    while (( waited < BADGER_PROBE_WAIT )); do
+        sleep 5
+        (( waited += 5 ))
+        logs=$(docker logs "${name}" 2>&1 || true)
+        grep -qiE "${TRAEFIK_PLUGIN_ERR_RE}" <<< "${logs}" && break
+        state=$(docker inspect -f '{{.State.Status}}' "${name}" 2>/dev/null || echo "gone")
+        [[ "${state}" != "running" ]] && break
+    done
+    state=$(docker inspect -f '{{.State.Status}}' "${name}" 2>/dev/null || echo "gone")
+    docker rm -f "${name}" >/dev/null 2>&1 || true
+
+    bad=$(grep -iE "${TRAEFIK_PLUGIN_ERR_RE}" <<< "${logs}" | tail -n 3 || true)
+    if [[ -n "${bad}" ]]; then
+        log WARN "[Проба] Traefik ${traefik_tag} НЕ загрузил Badger ${badger_ver}:"
+        while IFS= read -r l; do log WARN "  traefik> ${l:0:300}"; done <<< "${bad}"
+        return 1
+    fi
+    if [[ "${state}" != "running" ]]; then
+        log WARN "[Проба] Тестовый Traefik завершился раньше времени (${state}):"
+        while IFS= read -r l; do log WARN "  traefik> ${l:0:300}"; done <<< "$(tail -n 3 <<< "${logs}")"
+        return 1
+    fi
+    log OK "[Проба] Badger ${badger_ver} загружается в Traefik ${traefik_tag}"
+    return 0
+}
+
+# ─── Проверка логов боевого Traefik на ошибки загрузки плагинов ──────────────
+# Контейнер при такой ошибке остаётся running, поэтому docker inspect её не видит.
+# Возвращает: 0 — ошибок нет, 1 — плагины не загрузились.
+traefik_plugins_ok() {
+    local cid logs bad
+    cid=$(docker compose ps -q traefik 2>/dev/null || true)
+    [[ -z "${cid}" ]] && return 0   # состояние контейнера проверяет check_container
+    logs=$(docker logs --since "${STACK_STARTED_AT:-10m}" "${cid}" 2>&1 || true)
+    bad=$(grep -iE "${TRAEFIK_PLUGIN_ERR_RE}" <<< "${logs}" | tail -n 3 || true)
+    if [[ -n "${bad}" ]]; then
+        log WARN "Traefik: плагины не загрузились — ресурсы Pangolin недоступны, хотя контейнер работает:"
+        while IFS= read -r l; do log WARN "  traefik> ${l:0:300}"; done <<< "${bad}"
+        return 1
+    fi
+    return 0
+}
+
+# ─── Частичный откат: вернуть только версию Badger ───────────────────────────
+# Остальные компоненты остаются на новых версиях; перезапускается только Traefik.
+# Вызывается при отключённом errexit. Возвращает результат health_check.
+badger_rollback() {
+    local from="$1"
+    log WARN "┌──────────────────────────────────────────────────────────┐"
+    log WARN "│  ЧАСТИЧНЫЙ ОТКАТ: только Badger ${from} -> ${OLD_BADGER_V}"
+    log WARN "└──────────────────────────────────────────────────────────┘"
+
+    set_badger_version "${OLD_BADGER_V}" || return 1
+    log OK "[Badger] В traefik_config.yml возвращена версия ${OLD_BADGER_V}"
+
+    STACK_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    if ! docker compose restart traefik >> "${LOG_FILE}" 2>&1; then
+        log ERROR "[Badger] Не удалось перезапустить Traefik"
+        return 1
+    fi
+
+    local rc
+    health_check
+    rc=$?
+    if (( rc == 0 )); then
+        BADGER_V="${OLD_BADGER_V}"
+        BADGER_HELD_BACK=true
+        log OK "[Badger] Частичный откат успешен: Badger ${OLD_BADGER_V}, остальные компоненты обновлены"
+    fi
+    return "${rc}"
+}
+
 # ─── Чтение текущих версий из файлов конфигурации ───────────────────────────
 read_current_versions() {
     OLD_PANGOLIN_V=$(grep "image: docker.io/fosrl/pangolin" "${COMPOSE_FILE}" | cut -d: -f3)
     OLD_GERBIL_V=$(grep "image: docker.io/fosrl/gerbil"    "${COMPOSE_FILE}" | cut -d: -f3)
     OLD_TRAEFIK_V=$(grep "image: docker.io/traefik"        "${COMPOSE_FILE}" | cut -d: -f3)
-    OLD_BADGER_V=$(grep -A5 '^[[:space:]]*badger:' "${TRAEFIK_CONFIG}" \
-        | awk '/version:/ { v=$2; gsub(/"/, "", v); print v; exit }')
+    OLD_BADGER_V=$(get_badger_version)
 
     for var in OLD_PANGOLIN_V OLD_GERBIL_V OLD_TRAEFIK_V OLD_BADGER_V; do
         if [[ -z "${!var}" ]]; then
@@ -283,7 +442,8 @@ dump_failed_logs() {
 }
 
 # ─── Health check всего стека с повторными попытками ─────────────────────────
-# Возвращает: 0 — стек здоров, 1 — стек нездоров
+# Возвращает: 0 — стек здоров, 1 — нездоров контейнер,
+#             3 — контейнеры работают, но Traefik не загрузил плагины (Badger)
 health_check() {
     log INFO "Ожидание инициализации контейнеров (${HEALTH_INITIAL_WAIT}с)..."
     sleep "${HEALTH_INITIAL_WAIT}"
@@ -306,7 +466,12 @@ health_check() {
         done <<< "${ids}"
 
         if (( failed == 0 )); then
-            log OK "Health check пройден: все контейнеры работают корректно"
+            # Ошибка плагина не лечится ожиданием — повторы не нужны
+            if ! traefik_plugins_ok; then
+                log ERROR "Health check: контейнеры работают, но Traefik не загрузил плагин Badger"
+                return 3
+            fi
+            log OK "Health check пройден: все контейнеры работают корректно, плагины Traefik загружены"
             return 0
         fi
 
@@ -363,6 +528,7 @@ do_rollback() {
 
     # Запускаем стек на старых образах (они ещё в кэше, prune не вызывался)
     log INFO "[Откат] Запуск стека на предыдущих версиях (образы в локальном кэше)..."
+    STACK_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     docker compose up -d >> "${LOG_FILE}" 2>&1
     log OK "[Откат] Команда запуска выполнена"
 
@@ -384,6 +550,11 @@ do_rollback() {
     done <<< "${ids}"
 
     if (( rollback_failed == 0 )); then
+        if ! traefik_plugins_ok; then
+            log ERROR "[Откат] Контейнеры работают, но Traefik не загрузил плагины и на старых версиях."
+            log ERROR "[Откат] Вероятно, проблема на стороне каталога plugins.traefik.io — повторите позже."
+            return 1
+        fi
         log OK "┌──────────────────────────────────────────────────────────┐"
         log OK "│  Откат выполнен успешно. Стек работает на старых версиях │"
         log OK "└──────────────────────────────────────────────────────────┘"
@@ -876,7 +1047,12 @@ PANGOLIN_GH_V=$(get_github_latest "fosrl/pangolin")     # GitHub-релиз (vX.
 PANGOLIN_V=$(pangolin_image_tag "${PANGOLIN_GH_V}")     # тег образа нужной редакции
 GERBIL_V=$(get_github_latest "fosrl/gerbil")
 TRAEFIK_V=$(get_traefik_latest "${TRAEFIK_MAJOR}")
-BADGER_V=$(get_github_latest "fosrl/badger")
+BADGER_LATEST=$(get_github_latest "fosrl/badger")
+BADGER_V="${BADGER_LATEST}"
+if [[ -n "${BADGER_PIN}" ]]; then
+    BADGER_V="${BADGER_PIN}"
+    log INFO "Badger закреплён на ${BADGER_PIN} (BADGER_PIN); последний релиз: ${BADGER_LATEST}"
+fi
 
 # Выводим таблицу версий
 log INFO "Сравнение версий:"
@@ -897,7 +1073,45 @@ fi
 # Есть обновления. В режиме -info на этом и останавливаемся — без действий.
 if [[ "${INFO_ONLY}" == true ]]; then
     log INFO "Доступно обновление. Режим -info: действия не выполняются."
+    if [[ "${BADGER_PROBE}" == true ]] && \
+       [[ "${OLD_BADGER_V}" != "${BADGER_V}" || "${OLD_TRAEFIK_V}" != "${TRAEFIK_V}" ]]; then
+        log INFO "При обновлении совместимость Traefik ${TRAEFIK_V} + Badger ${BADGER_V} будет проверена тестовым контейнером."
+    fi
     exit 0
+fi
+
+# ─── Проба совместимости Traefik + Badger до остановки стека ─────────────────
+# Если новая пара не работает, проблемный компонент остаётся на прежней версии,
+# а остальные обновляются как обычно.
+if [[ "${BADGER_PROBE}" == true ]] && \
+   [[ "${OLD_BADGER_V}" != "${BADGER_V}" || "${OLD_TRAEFIK_V}" != "${TRAEFIK_V}" ]]; then
+    if ! probe_badger "${TRAEFIK_V}" "${BADGER_V}"; then
+        if [[ "${OLD_BADGER_V}" != "${BADGER_V}" ]]; then
+            log WARN "Badger ${BADGER_V} не загружается — Badger остаётся на ${OLD_BADGER_V}"
+            BADGER_V="${OLD_BADGER_V}"
+            BADGER_HELD_BACK=true
+            # Новый Traefik нужно проверить и со старым Badger
+            if [[ "${OLD_TRAEFIK_V}" != "${TRAEFIK_V}" ]] && ! probe_badger "${TRAEFIK_V}" "${BADGER_V}"; then
+                log WARN "Traefik ${TRAEFIK_V} не загружает и Badger ${BADGER_V} — Traefik остаётся на ${OLD_TRAEFIK_V}"
+                TRAEFIK_V="${OLD_TRAEFIK_V}"
+            fi
+        else
+            log WARN "Traefik ${TRAEFIK_V} не загружает Badger ${BADGER_V} — Traefik остаётся на ${OLD_TRAEFIK_V}"
+            TRAEFIK_V="${OLD_TRAEFIK_V}"
+        fi
+
+        log INFO "Скорректированный план обновления:"
+        print_version_line "Pangolin" "${OLD_PANGOLIN_V}" "${PANGOLIN_V}"
+        print_version_line "Gerbil"   "${OLD_GERBIL_V}"   "${GERBIL_V}"
+        print_version_line "Traefik"  "${OLD_TRAEFIK_V}"  "${TRAEFIK_V}"
+        print_version_line "Badger"   "${OLD_BADGER_V}"   "${BADGER_V}"
+
+        if [[ "${OLD_PANGOLIN_V}" == "${PANGOLIN_V}" && "${OLD_GERBIL_V}" == "${GERBIL_V}" &&
+              "${OLD_TRAEFIK_V}"  == "${TRAEFIK_V}"  && "${OLD_BADGER_V}" == "${BADGER_V}" ]]; then
+            log INFO "После пробы обновлять нечего — стек не трогаю. Повторная попытка при следующем запуске."
+            exit 0
+        fi
+    fi
 fi
 
 # Создаём резервные копии
@@ -921,7 +1135,9 @@ log INFO "Обновление версий в конфигурационных 
 sed -i -E "s|(docker.io/fosrl/pangolin:)[^[:space:]]+|\1${PANGOLIN_V}|" "${COMPOSE_FILE}"
 sed -i -E "s|(docker.io/fosrl/gerbil:)[^[:space:]]+|\1${GERBIL_V}|"    "${COMPOSE_FILE}"
 sed -i -E "s|(docker.io/traefik:)[^[:space:]]+|\1${TRAEFIK_V}|"        "${COMPOSE_FILE}"
-sed -i -E "s|^([[:space:]]*version:[[:space:]]*)(\"?)[^\"[:space:]]+(\"?)|\1\2${BADGER_V}\3|" "${TRAEFIK_CONFIG}"
+if [[ "${OLD_BADGER_V}" != "${BADGER_V}" ]]; then
+    set_badger_version "${BADGER_V}"
+fi
 log OK "Файлы конфигурации обновлены"
 
 # Скачиваем новые образы
@@ -947,6 +1163,7 @@ log OK "Образы скачаны"
 
 # Запускаем стек с новыми версиями
 log INFO "Запуск Docker-стека..."
+STACK_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 docker compose up -d >> "${LOG_FILE}" 2>&1
 log OK "Стек запущен, начинаем проверку работоспособности..."
 
@@ -955,6 +1172,31 @@ log OK "Стек запущен, начинаем проверку работо�
 set +e
 health_check
 HEALTH_RESULT=$?
+
+# Миграция Pangolin при первом запуске новой версии может сама переписать
+# версию Badger в traefik_config.yml (так 1.25.x ставит v1.8.0). Traefik
+# применит её только при следующем перезапуске — например, ночью после
+# перезагрузки сервера. Проверяем это сейчас, под контролем скрипта.
+FILE_BADGER_V=$(get_badger_version)
+if (( HEALTH_RESULT == 0 )) && [[ -n "${FILE_BADGER_V}" && "${FILE_BADGER_V}" != "${BADGER_V}" ]]; then
+    log WARN "Версия Badger в traefik_config.yml изменена после запуска (вероятно, миграцией Pangolin): ${BADGER_V} -> ${FILE_BADGER_V}"
+    log WARN "Перезапускаю Traefik, чтобы проверить новую версию сейчас, а не при случайном рестарте"
+    STACK_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    docker compose restart traefik >> "${LOG_FILE}" 2>&1
+    health_check
+    HEALTH_RESULT=$?
+    (( HEALTH_RESULT == 0 )) && BADGER_V="${FILE_BADGER_V}"
+fi
+
+# Сломался только плагин, и версия Badger отличается от рабочей — откатываем
+# только Badger, не трогая остальные обновлённые компоненты.
+if (( HEALTH_RESULT == 3 )); then
+    FILE_BADGER_V=$(get_badger_version)
+    if [[ -n "${FILE_BADGER_V}" && "${FILE_BADGER_V}" != "${OLD_BADGER_V}" ]]; then
+        badger_rollback "${FILE_BADGER_V}"
+        HEALTH_RESULT=$?
+    fi
+fi
 set -e
 
 if (( HEALTH_RESULT != 0 )); then
@@ -980,6 +1222,11 @@ docker image prune -a -f >> "${LOG_FILE}" 2>&1
 log OK "Устаревшие образы удалены"
 
 log OK "Обновление успешно завершено"
+
+if [[ "${BADGER_HELD_BACK}" == true ]]; then
+    log WARN "Badger оставлен на ${BADGER_V}: новая версия не загружается в Traefik."
+    log WARN "Скрипт попробует снова при следующем запуске. Закрепить версию вручную: BADGER_PIN=\"${BADGER_V}\""
+fi
 
 # Напоминание об активации лицензии при переходе на Enterprise Edition
 if [[ "${EDITION_SWITCH}" == true && "${ENTERPRISE}" == true ]]; then
