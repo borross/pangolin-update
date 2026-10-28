@@ -1,6 +1,6 @@
 # pangolin-update.sh
 
-**Версия:** 0.6 · **Дата:** 26.10.2026
+**Версия:** 0.9 · **Дата:** 27.10.2026
 
 ---
 
@@ -16,6 +16,9 @@
 - [Полное резервное копирование и восстановление](#полное-резервное-копирование-и-восстановление)
 - [Интеграция с Cloudflare](#интеграция-с-cloudflare)
 - [Защита плагина Badger](#защита-плагина-badger)
+- [CrowdSec + AppSec и crowdsec-manager](#crowdsec--appsec-и-crowdsec-manager)
+  - [Установка одной командой](#установка-одной-командой)
+  - [Allowlist своей инфраструктуры](#allowlist-своей-инфраструктуры)
 - [Логика работы](#логика-работы)
 - [Health check](#health-check)
 - [Автоматический откат](#автоматический-откат)
@@ -60,6 +63,9 @@
 | **Gerbil** | GitHub Releases (`fosrl/gerbil`) | Вспомогательный сервис |
 | **Traefik** | GitHub Releases (`traefik/traefik`) | Reverse-proxy |
 | **Badger** | GitHub Releases (`fosrl/badger`) | Плагин Traefik |
+| **CrowdSec** *(необязательный)* | GitHub Releases (`crowdsecurity/crowdsec`) + проверка тега в Docker Hub | Защита от атак и WAF (AppSec). Учитывается, только если сервис `crowdsec` есть в compose и его тег закреплён (`v1.8.1`, не `latest`). Обновляется только в своей мажорной ветке. |
+
+> Плагин-bouncer CrowdSec и образ `crowdsec-manager` скрипт **не обновляет** — их версии закреплены и меняются вручную. Плагин-bouncer при этом участвует в пробе Traefik (см. [Защита плагина Badger](#защита-плагина-badger)).
 
 > **Версия Traefik.** Берётся с GitHub Releases (а не с Docker Hub). Сначала запрашивается `/releases/latest`; если он указывает на чужую мажорную ветку (например, в день выхода патча ветки v2.11.x) или возвращает пустой/битый ответ, скрипт добирает последнюю стабильную версию **строго в пределах текущей мажорной ветки**. Мажор определяется автоматически из установленной версии, поэтому стек никогда не «перепрыгнет» на другой major (v2 ↔ v3 ↔ будущий v4), где возможны несовместимые изменения. Срабатывание запасного пути фиксируется в логе уровнем `WARN`.
 
@@ -135,6 +141,33 @@ CF_SYNC_INTERVAL=5                           # период синхрониза
 BADGER_PIN=""            # закрепить версию Badger, напр. "v1.7.0"; пусто = следовать за релизами
 BADGER_PROBE=true        # проверять пару Traefik+Badger тестовым контейнером до обновления
 BADGER_PROBE_WAIT=30     # сколько секунд ждать ошибку загрузки плагина в пробе
+
+# CrowdSec (см. «CrowdSec + AppSec и crowdsec-manager»)
+CROWDSEC_SERVICE="crowdsec"         # имя сервиса CrowdSec в compose
+CROWDSEC_AUTO_UPDATE=true           # обновлять образ CrowdSec вместе со стеком
+CROWDSEC_HUB_UPDATE=true            # обновлять правила Hub при каждом запуске
+LOGS_EXCLUDE="config/traefik/logs"  # не включать в полный бэкап (растущие логи)
+HEALTH_IGNORE_SERVICES="crowdsec-manager"  # сбой этих сервисов не вызывает откат
+
+# Allowlist CrowdSec (см. «Allowlist своей инфраструктуры»)
+ALLOWLIST_SYNC=true                  # синхронизировать при обычном запуске
+ALLOWLIST_NAME="pangolin-infra"      # имя allowlist в CrowdSec
+ALLOWLIST_EXTRA=""                   # доп. адреса/подсети через пробел (дом, офис, VPN)
+ALLOWLIST_NEWT_MAX_AGE_DAYS=7        # сайт Newt без связи дольше — его IP убирается
+ALLOWLIST_CRON_FILE="/etc/cron.d/pangolin-allowlist"
+ALLOWLIST_SYNC_INTERVAL=10           # период cron-синхронизации (минуты)
+PANGOLIN_DB="${PANGOLIN_DIR}/config/db/db.sqlite"
+
+# Установка CrowdSec (-crowdsec-install)
+CROWDSEC_IMAGE_TAG="v1.8.1"                     # тег образа crowdsecurity/crowdsec
+CROWDSEC_BOUNCER_VERSION="v1.8.1"               # версия плагина-bouncer для Traefik
+CROWDSEC_INSTALL_MANAGER=true                   # ставить веб-интерфейс crowdsec-manager
+CROWDSEC_MANAGER_IMAGE="docker.io/hhftechnology/crowdsec-manager:2.4.1"
+CROWDSEC_ENTRYPOINT="websecure"                 # entrypoint Traefik, который защищается
+CROWDSEC_BOUNCER_NAME="traefik-bouncer"
+TRAEFIK_DYNAMIC_CONFIG="${PANGOLIN_DIR}/config/traefik/dynamic_config.yml"
+TRAEFIK_LOGROTATE_FILE="/etc/logrotate.d/pangolin-traefik"
+YQ_IMAGE="docker.io/mikefarah/yq:4.53.6"         # правка YAML в контейнере
 ```
 
 Суммарное время ожидания health check: `HEALTH_INITIAL_WAIT + HEALTH_INTERVAL × HEALTH_RETRIES` = **80 секунд** при настройках по умолчанию.
@@ -162,6 +195,14 @@ bash /usr/local/bin/pangolin-update.sh
 | `-cloudflare [токен]`, `--cf [токен]` | **Включить интеграцию с Cloudflare**: автоматическое создание A-записей в Cloudflare DNS для новых поддоменов (ресурсов) Pangolin. Ставит cron-задачу синхронизации. Токен — аргументом или через переменную окружения `CLOUDFLARE_API_TOKEN`. |
 | `-cloudflare-off`, `--cf-off` | **Отключить интеграцию с Cloudflare**: убрать cron-задачу и файл настроек. Уже созданные DNS-записи не удаляются. |
 | `-dns-sync`, `--dns-sync` | Разовая **синхронизация DNS-записей** (её и вызывает cron; можно запускать вручную). Добавляет только недостающие записи, существующие не трогает. |
+| `-crowdsec-install`, `--crowdsec-install` | **Установить CrowdSec + AppSec + crowdsec-manager** в работающий Pangolin одной командой. См. [Установка одной командой](#установка-одной-командой). |
+| `-no-manager` | Вместе с `-crowdsec-install`: без веб-интерфейса crowdsec-manager. |
+| `-crowdsec-uninstall`, `--crowdsec-uninstall` | **Удалить CrowdSec** из стека и вернуть Traefik к работе без него. Данные остаются на диске. |
+| `-y`, `--yes` | Не спрашивать подтверждение (установка/удаление без терминала). |
+| `-crowdsec-hub`, `--crowdsec-hub` | Только **обновить правила CrowdSec** из Hub (сценарии, виртуальные патчи AppSec), стек не трогается. Обычный запуск делает это автоматически. |
+| `-allowlist-sync`, `--allowlist-sync` | Разовая **синхронизация allowlist** CrowdSec: публичные IP сервера и сайтов Newt + `ALLOWLIST_EXTRA`. Устаревшие автоматические записи удаляются. Вызывается из cron. |
+| `-allowlist-on`, `--allowlist-on` | Поставить cron-задачу синхронизации allowlist (каждые `ALLOWLIST_SYNC_INTERVAL` мин) и сразу синхронизировать. |
+| `-allowlist-off`, `--allowlist-off` | Убрать cron-задачу. Сам allowlist сохраняется. |
 | `-h`, `--help` | Показать справку и выйти. |
 
 > Без флага редакции текущая редакция Pangolin определяется автоматически по тегу образа в `docker-compose.yml` и сохраняется. Поэтому запуск из cron без флага не переключит редакцию случайно.
@@ -290,7 +331,7 @@ pangolin-update.sh -community
 - `docker-compose.yml`
 - весь каталог `config/`: **базу данных Pangolin** (`config/db/`), **сертификаты Let's Encrypt** (`config/letsencrypt/`), конфигурацию Traefik и `config.yml`
 
-Архивы сохраняются в `BACKUP_DIR` (по умолчанию `/root/pangolin-backups`) с именем `pangolin_DDMMYYYY_HHMMSS.tar.gz`. Хранятся последние `BACKUP_KEEP` архивов (по умолчанию 7), более старые удаляются автоматически. Файлы `*.bak.*` в архив не включаются.
+Архивы сохраняются в `BACKUP_DIR` (по умолчанию `/root/pangolin-backups`) с именем `pangolin_DDMMYYYY_HHMMSS.tar.gz`. Хранятся последние `BACKUP_KEEP` архивов (по умолчанию 7), более старые удаляются автоматически. Файлы `*.bak.*` и логи Traefik (`config/traefik/logs`) в архив не включаются.
 
 ### Создание резервной копии
 
@@ -440,7 +481,7 @@ Badger — плагин Traefik, через который проходят вс
 
 | Уровень | Когда | Что делает |
 |---------|-------|------------|
-| **1. Проба до обновления** | до остановки стека | Запускает одноразовый контейнер Traefik целевой версии с одним плагином Badger целевой версии. Traefik сам качает плагин и проходит ту же проверку целостности. Работающий стек не затрагивается. Если проба не прошла — проблемный компонент (Badger, а при необходимости и Traefik) **остаётся на прежней версии, остальные обновляются**. |
+| **1. Проба до обновления** | до остановки стека | Запускает одноразовый контейнер Traefik целевой версии со **всеми плагинами** из `traefik_config.yml` (Badger — в целевой версии, bouncer CrowdSec и прочие — в текущих). Traefik сам качает плагины и проходит ту же проверку целостности. Работающий стек не затрагивается. Если проба не прошла — проблемный компонент (Badger, а при необходимости и Traefik) **остаётся на прежней версии, остальные обновляются**. |
 | **2. Проверка логов в health check** | после запуска | Помимо состояния контейнеров читает логи Traefik с момента запуска и ищет ошибки загрузки плагинов. Такая ошибка — отдельный результат (код `3` внутри скрипта), без бессмысленных повторов. |
 | **3. Контроль миграции Pangolin** | после запуска | Если после старта версия Badger в `traefik_config.yml` изменилась (её переписала миграция Pangolin), Traefik применил бы её только при следующем рестарте — например, после ночной перезагрузки. Скрипт сразу перезапускает Traefik и проверяет новую версию под своим контролем. |
 | **4. Частичный откат** | при ошибке плагина | Возвращает в `traefik_config.yml` прежнюю рабочую версию Badger и перезапускает **только Traefik**. Pangolin, Gerbil и Traefik остаются на новых версиях. Полный откат стека — только если и это не помогло. |
@@ -485,6 +526,260 @@ BADGER_PIN="v1.7.0"
 
 ---
 
+## CrowdSec + AppSec и crowdsec-manager
+
+### Что это даёт
+
+| Часть | Что делает |
+|-------|-----------|
+| **CrowdSec** | Читает access-лог Traefik и замечает поведение атакующих: перебор паролей, сканирование путей (`/wp-admin`, `/.env`), всплески 404. Нарушитель получает бан (по умолчанию на 4 часа) сразу на всех ресурсах. Плюс общий блоклист сообщества CrowdSec. |
+| **AppSec** (WAF) | Проверяет **каждый запрос** до того, как он дойдёт до сервиса: виртуальные патчи против известных CVE и общие правила против типовых атак. Повторяющиеся срабатывания превращаются в бан IP. |
+| **Bouncer** (плагин Traefik) | Исполняет решения: перед каждым запросом проверяет IP по списку банов и передаёт запрос в AppSec. Подключён ко всему entrypoint `websecure`. |
+| **crowdsec-manager** | Веб-интерфейс: алерты, баны/разбаны, allowlist, сценарии, коллекции Hub, логи. |
+
+```
+Клиент ──► Traefik (websecure :443)
+              │
+              ├─► bouncer: IP в бане? ──── да ──► 403
+              ├─► AppSec (crowdsec:7422): запрос опасен? ── да ──► 403
+              │
+              └─► Badger (авторизация Pangolin) ──► Gerbil ──► Newt ──► сервис
+
+access.log Traefik ──► CrowdSec (сценарии) ──► решения (баны) ──► bouncer
+```
+
+### Установка одной командой
+
+```bash
+pangolin-update.sh -crowdsec-install
+```
+
+Скрипт спросит подтверждение (стек остановится на 1–3 минуты) и сделает всё сам. Без терминала — с флагом `-y`; без веб-интерфейса — с `-no-manager`.
+
+**Что происходит**
+
+| Этап | Стек | Что делается |
+|------|------|--------------|
+| 1. Проверки | работает | Файлы на месте; `docker compose config` проходит; есть сервис `traefik` и entrypoint `websecure`; Traefik читает `dynamic_config.yml`; CrowdSec ещё не установлен; нет посторонних контейнеров с именами `crowdsec` / `crowdsec-manager`. |
+| 2. Проба плагина | работает | Одноразовый Traefik **вашей текущей версии** загружает Badger и bouncer CrowdSec. Не загрузил — установка отменяется, ничего не тронуто. |
+| 3. Образы | работает | Заранее скачиваются CrowdSec и crowdsec-manager, чтобы простой не зависел от скорости загрузки. |
+| 4. Бэкап | остановлен | Копии трёх конфигов (`*.bak.ДАТА`) и полный архив стека в `BACKUP_DIR`. |
+| 5. Конфиги | остановлен | `docker-compose.yml`: сервисы `crowdsec`, `crowdsec-manager`, у `traefik` — volume с логами и зависимость от `crowdsec`. `traefik_config.yml`: плагин-bouncer, access-лог в JSON, middleware на `websecure`. `dynamic_config.yml`: middleware `crowdsec`. Источники событий в `config/crowdsec/acquis.d/`. |
+| 6. Запуск | запускается | Сначала CrowdSec (первый старт качает правила из Hub, до 3 мин), регистрация bouncer со сгенерированным ключом, затем весь стек и обычный health check, включая проверку загрузки плагинов. |
+| 7. Завершение | работает | Ротация access-лога, проверка связи bouncer ↔ CrowdSec и тестовый запрос `/.env` (ожидается 403), allowlist сервера и сайтов Newt + cron-задача, обновление правил Hub. |
+
+**Если что-то пошло не так** на этапах 5–6, скрипт восстанавливает три конфига из копий, поднимает стек как был и проверяет его (код выхода `1`). Если и откат не помог — код `2`, полный архив для `-restore` сделан на этапе 4.
+
+**Как правятся конфиги.** YAML меняет утилита [yq](https://github.com/mikefarah/yq) в одноразовом контейнере — на сервер ничего не ставится. Комментарии и порядок ключей сохраняются; yq убирает только пустые строки между блоками. Если в compose сети у `gerbil` заданы явно, те же сети получает `crowdsec`, иначе Traefik его не найдёт. Обе формы `depends_on` (список и словарь) поддерживаются.
+
+**Cloudflare.** Если включена интеграция с Cloudflare и `CF_PROXIED=true`, bouncer настраивается на реальный IP из заголовка `CF-Connecting-IP`, а доверенными адресами становятся актуальные диапазоны Cloudflare.
+
+**После установки** откройте веб-интерфейс через Pangolin, как описано в шаге 8 ручной установки ниже. Порт crowdsec-manager наружу не публикуется, а своей авторизации у него нет.
+
+**Удаление**
+
+```bash
+pangolin-update.sh -crowdsec-uninstall
+```
+
+Убирает из конфигов всё, что добавила установка (volume логов у `traefik` остаётся: в свежих установках Pangolin он есть изначально), перезапускает стек, проверяет его и при сбое возвращает прежние конфиги. Данные `config/crowdsec` и `crowdsec-manager/` остаются на диске.
+
+### Ручная установка (запасной вариант)
+
+Если автоматическая установка не подходит (нестандартные имена сервисов, PostgreSQL-сборка, свой порядок действий), всё то же самое можно сделать руками по комплекту `crowdsec-kit/`.
+
+#### Комплект файлов
+
+Каталог `crowdsec-kit/`:
+
+| Файл | Куда |
+|------|------|
+| `docker-compose.crowdsec.yml` | Сервисы `crowdsec` и `crowdsec-manager` + дополнения к `traefik` — перенести в `docker-compose.yml` |
+| `traefik_config.crowdsec.yml` | Плагин-bouncer, access-лог, middleware на `websecure` — дописать в `config/traefik/traefik_config.yml` |
+| `dynamic_config.crowdsec.yml` | Middleware `crowdsec` — дописать в `config/traefik/dynamic_config.yml` |
+| `config/crowdsec/acquis.d/*.yaml` | Источники событий CrowdSec — скопировать как есть |
+| `pangolin-traefik.logrotate` | Ротация access-лога — в `/etc/logrotate.d/pangolin-traefik` |
+
+Версии закреплены: CrowdSec `v1.8.1`, bouncer `v1.8.1`, crowdsec-manager `2.4.1`.
+
+#### Отличия от шаблона установщика Pangolin
+
+Конфигурация (и автоматическая, и из комплекта) основана на шаблоне CrowdSec из установщика Pangolin (`installer --crowdsec`), с исправлениями:
+
+| Параметр | Шаблон Pangolin | Комплект | Почему |
+|----------|----------------|----------|--------|
+| `forwardedHeadersTrustedIPs` | `0.0.0.0/0` | `[]` | Доверие `X-Forwarded-For` от всех позволяет обойти бан, подставив чужой IP в заголовок |
+| `crowdsecMode` | `live` | `stream` | Список банов кэшируется в Traefik — быстрее и не зависит от доступности CrowdSec в момент запроса |
+| `crowdsecAppsecUnreachableBlock` | `true` | `false` | Если CrowdSec лёг (обновление, сбой), сайты работают без WAF, а не блокируются целиком вместе с панелью Pangolin |
+| Порты `6060` и т. п. | опубликованы | не опубликованы | Docker NAT обходит UFW — метрики и API были бы доступны из интернета |
+| Тег образа CrowdSec | `latest` | `v1.8.1` | С `latest` откат невозможен |
+| Профиль `captcha` | включён | не используется | Капча требует настройки провайдера (Turnstile/hCaptcha); без неё — обычный бан |
+
+#### Шаги
+
+Все команды — в `/root/pangolin`.
+
+**0. Резервная копия**
+
+```bash
+pangolin-update.sh -backup
+```
+
+**1. Каталоги и источники событий**
+
+```bash
+cd /root/pangolin
+mkdir -p config/crowdsec/acquis.d config/crowdsec/db config/traefik/logs \
+         crowdsec-manager/data crowdsec-manager/backups
+cp crowdsec-kit/config/crowdsec/acquis.d/*.yaml config/crowdsec/acquis.d/
+```
+
+**2. docker-compose.yml**
+
+Перенесите сервисы `crowdsec` и `crowdsec-manager` из `docker-compose.crowdsec.yml` в раздел `services:`, а в существующий сервис `traefik` добавьте volume `./config/traefik/logs:/var/log/traefik` и зависимость `crowdsec` (`condition: service_healthy`). Проверка синтаксиса:
+
+```bash
+docker compose config -q && echo OK
+```
+
+**3. Запуск CrowdSec и ключ для bouncer**
+
+```bash
+docker compose up -d crowdsec
+docker compose ps crowdsec                 # дождитесь (healthy)
+docker exec crowdsec cscli bouncers add traefik-bouncer
+```
+
+Сохраните выведенный ключ — он показывается один раз.
+
+**4. Конфигурация Traefik**
+
+- В `config/traefik/dynamic_config.yml` добавьте middleware `crowdsec` из `dynamic_config.crowdsec.yml` и вставьте ключ вместо `PUT_YOUR_BOUNCER_KEY_HERE`.
+- В `config/traefik/traefik_config.yml` добавьте плагин `crowdsec`, раздел `accessLog` и `middlewares: [crowdsec@file]` в `entryPoints.websecure.http` (см. `traefik_config.crowdsec.yml`).
+
+> Не задавайте `log.filePath` для основного лога Traefik: он должен оставаться в `docker logs`, иначе скрипт не увидит ошибки загрузки плагинов.
+
+**5. Запуск всего стека**
+
+```bash
+docker compose up -d
+docker compose logs traefik | grep -iE 'plugin|crowdsec|error'
+```
+
+В логе не должно быть `Plugins are disabled`.
+
+**6. Ротация access-лога**
+
+```bash
+cp crowdsec-kit/pangolin-traefik.logrotate /etc/logrotate.d/pangolin-traefik
+logrotate -d /etc/logrotate.d/pangolin-traefik    # проверка без изменений
+```
+
+**7. Проверка работы**
+
+```bash
+# Traefik забирает решения (столбец Last API pull — свежий)
+docker exec crowdsec cscli bouncers list
+
+# Логи Traefik читаются, AppSec получает запросы
+docker exec crowdsec cscli metrics
+
+# Бан работает: забаньте свой IP на 2 минуты → любой ресурс отвечает 403
+docker exec crowdsec cscli decisions add --ip <ВАШ_IP> -d 2m
+docker exec crowdsec cscli decisions delete --ip <ВАШ_IP>
+
+# AppSec работает: запрос к /.env должен получить 403
+curl -sI https://<ресурс>/.env | head -1
+```
+
+> Не повторяйте тест AppSec много раз подряд: серия срабатываний превращается в бан вашего IP. Разбан — `cscli decisions delete --ip <IP>` или в crowdsec-manager.
+
+**8. Веб-интерфейс через Pangolin**
+
+У crowdsec-manager **нет собственной авторизации**, а через `docker.sock` он управляет Docker хоста. Поэтому порт не публикуется, а доступ — только через Pangolin с авторизацией:
+
+1. В панели Pangolin создайте сайт типа **Local** (если его ещё нет) — для сервисов на том же сервере, что и Pangolin.
+2. Создайте HTTP-ресурс, например `crowdsec.example.com`, на этом сайте с целью `http://crowdsec-manager:8080`.
+3. В настройках ресурса включите **аутентификацию** и разрешите доступ только своему пользователю или роли администратора.
+
+**9. Allowlist своей инфраструктуры**
+
+```bash
+pangolin-update.sh -allowlist-on
+```
+
+(При установке через `-crowdsec-install` этот шаг выполняется автоматически.)
+
+Скрипт добавит в allowlist публичные IP сервера и всех активных сайтов Newt и поставит cron-задачу, которая отслеживает новые сайты и смену их адресов. Подробности — в разделе [Allowlist своей инфраструктуры](#allowlist-своей-инфраструктуры).
+
+### Allowlist своей инфраструктуры
+
+Бан IP сайта Newt обрывает туннель вместе со всеми ресурсами этого сайта, а бан IP самого сервера ломает обращения сервисов к собственным доменам. Поэтому эти адреса держатся в отдельном allowlist CrowdSec (`pangolin-infra`). Allowlist действует и на баны, и на AppSec.
+
+**Откуда берутся адреса**
+
+| Источник | Как определяется | Описание записи |
+|----------|------------------|-----------------|
+| Сервер | Внешний IPv4 (api.ipify.org / ifconfig.me), внешний IPv6 (api6.ipify.org), `CF_TARGET_IP` из настроек Cloudflare, глобальные адреса интерфейсов хоста | `auto: server` |
+| Сайты Newt | Таблица `sites` в БД Pangolin (`config/db/db.sqlite`), поле `endpoint`. Это публичный `ip:порт`, с которого Newt пробивает туннель к Gerbil; Pangolin обновляет его при каждом hole punch | `auto: newt <имя сайта>` |
+| Вручную | `ALLOWLIST_EXTRA` в блоке конфигурации (IP или подсети через пробел) | `auto: config ALLOWLIST_EXTRA` |
+
+Частные адреса (10/8, 172.16/12, 192.168/16, CGNAT 100.64/10, loopback, link-local, ULA) не добавляются: сайт в одной сети с сервером виден по частному адресу, а такие адреса CrowdSec и так не банит (парсер `crowdsecurity/whitelists`).
+
+БД читается **только на чтение**: через `sqlite3` или `python3` на хосте, а если их нет — через Node.js внутри контейнера `pangolin`. Ставить на сервер ничего не нужно. Установки Pangolin с PostgreSQL не поддерживаются — для них адреса сайтов указываются в `ALLOWLIST_EXTRA`.
+
+**Как работает синхронизация**
+
+1. Собирает адреса из трёх источников.
+2. Создаёт allowlist, если его нет (нужен CrowdSec 1.6.8+).
+3. Добавляет недостающие адреса и снимает с них бан, если он уже был.
+4. **Удаляет устаревшие автоматические записи** (`auto: ...`), которых больше нет в источниках. Например, у сайта сменился IP у провайдера: старый адрес мог достаться кому-то другому, и оставлять его в allowlist небезопасно. Сайт, не выходивший на связь дольше `ALLOWLIST_NEWT_MAX_AGE_DAYS` дней, тоже убирается.
+
+Защиты:
+
+- **Ручные записи не трогаются.** Всё, что добавлено через crowdsec-manager или `cscli` с другим описанием, скрипт не удаляет — даже в том же allowlist.
+- **Нет данных — нет удалений.** Если БД Pangolin прочитать не удалось, записи Newt не меняются; если не определился IP сервера — не меняются записи сервера.
+- **Тихий cron.** Из cron в лог пишутся только изменения и ошибки.
+
+**Когда запускается**
+
+- при каждом обычном запуске скрипта (ночное обновление), если `ALLOWLIST_SYNC=true`;
+- по cron каждые `ALLOWLIST_SYNC_INTERVAL` минут после `-allowlist-on`. Новый сайт Newt попадёт в allowlist в течение этого времени;
+- вручную: `pangolin-update.sh -allowlist-sync`.
+
+**Просмотр**
+
+```bash
+docker exec crowdsec cscli allowlists inspect pangolin-infra
+docker exec crowdsec cscli allowlists check 198.51.100.7    # входит ли адрес в какой-либо allowlist
+```
+
+Allowlist виден и в crowdsec-manager → Allowlists.
+
+> Клиенты Pangolin (Olm) в allowlist не попадают: это устройства пользователей с меняющимися адресами. Нужные постоянные адреса (дом, офис) добавьте в `ALLOWLIST_EXTRA`.
+
+### Что делает pangolin-update.sh
+
+| Что | Как |
+|-----|-----|
+| Образ CrowdSec | Обновляется вместе со стеком в пределах мажорной ветки и только если тег уже опубликован в Docker Hub. При сбое откатывается вместе со стеком. |
+| Правила Hub | При **каждом** запуске (даже без обновлений стека): `cscli hub update` + `upgrade`. При изменениях CrowdSec перечитывает конфигурацию (SIGHUP) без перезапуска; если после этого не отвечает — перезапуск контейнера, затем код выхода `3`. Вручную: `-crowdsec-hub`. |
+| Плагин-bouncer | Не обновляется автоматически, но входит в пробу Traefik и в проверку логов плагинов. |
+| crowdsec-manager | Не обновляется автоматически. Его сбой не вызывает откат стека (`HEALTH_IGNORE_SERVICES`). Обновление: поменять тег в compose и `docker compose up -d crowdsec-manager`. |
+| Allowlist | IP сервера и сайтов Newt синхронизируются при каждом запуске и по cron (после `-allowlist-on`). См. [Allowlist своей инфраструктуры](#allowlist-своей-инфраструктуры). |
+| Бэкап | `config/crowdsec` (конфигурация, БД решений) входит в полный бэкап; `config/traefik/logs` — нет. |
+
+> Функция **Stack Updates** в crowdsec-manager отключена: `docker-compose.yml` смонтирован в него только для чтения, чтобы обновлениями стека управлял один инструмент — этот скрипт.
+
+### Особенности
+
+- **Ложные срабатывания AppSec.** Middleware подключён ко всему entrypoint, поэтому правила действуют на все ресурсы, включая панель Pangolin. Если сервис начал отвечать 403, смотрите `cscli alerts list` (или алерты в crowdsec-manager): там видно, какое правило сработало. Коллекция `crowdsecurity/appsec-crs` (OWASP CRS) даёт заметно больше ложных срабатываний — включайте её осознанно.
+- **Cloudflare-прокси.** При `CF_PROXIED=true` Traefik видит адреса Cloudflare. Нужно вписать [диапазоны Cloudflare](https://www.cloudflare.com/ips/) в `forwardedHeadersTrustedIPs` и включить `forwardedHeadersCustomName: CF-Connecting-IP`, иначе CrowdSec будет банить серверы Cloudflare.
+- **TCP/UDP-ресурсы** Pangolin проходят мимо HTTP-middleware — bouncer и AppSec их не защищают.
+- **Строгий режим.** `crowdsecAppsecUnreachableBlock: true` закрывает окно «без WAF» при падении CrowdSec ценой полной недоступности ресурсов в это время.
+
+---
+
 ## Логика работы
 
 ```
@@ -502,19 +797,27 @@ BADGER_PIN="v1.7.0"
   ├─[-cloudflare-off]► удаление cron-задачи и .cf-dns.env
   ├─[-dns-sync]──────► поддомены Pangolin → недостающие A-записи в Cloudflare
   │                    (стек не трогается; при занятом lock — тихий пропуск)
+  ├─[-crowdsec-hub]──► обновление правил CrowdSec из Hub ──► Выход (код 0 / 3)
+  ├─[-allowlist-sync]► IP сервера + сайтов Newt (БД Pangolin) → allowlist CrowdSec
+  │                    (при занятом lock — тихий пропуск)
+  ├─[-allowlist-on/off]► установка / удаление cron-задачи синхронизации
+  ├─[-crowdsec-install]► проверки → проба плагина → образы → бэкап (down) → yq-правка
+  │                      конфигов → crowdsec → bouncer → up → health check
+  │                      ──[сбой]──► восстановление конфигов, up ──► Выход (код 1 / 2)
+  ├─[-crowdsec-uninstall]► yq-правка конфигов → up → health check ──[сбой]──► возврат
   │
   ├─► Чтение текущих версий   (из docker-compose.yml и traefik_config.yml)
   ├─► Определение редакции    (CE/EE по тегу образа; флаг важнее автоопределения)
-  ├─► Запрос актуальных версий (GitHub API; Traefik закреплён на текущем major)
+  ├─► Запрос актуальных версий (GitHub API; Traefik и CrowdSec — в пределах своего major)
   ├─► Вывод таблицы сравнения
   │
   ├─[режим -info]──────────► Выход (код 0), без изменений
   │
-  ├─[Все версии совпадают]──► Выход (код 0)
+  ├─[Все версии совпадают]──► Правила Hub + allowlist ──► Выход (код 0 / 3)
   │
   └─[Есть обновления]
         │
-        ├─► Проба Traefik+Badger в тестовом контейнере (стек работает)
+        ├─► Проба Traefik + все плагины в тестовом контейнере (стек работает)
         │     └─[не прошла]──► проблемный компонент остаётся на старой версии
         ├─► Создание резервных копий конфигов  (.bak.DDMMYYYY_HHMMSS)
         ├─► docker compose down
@@ -528,7 +831,7 @@ BADGER_PIN="v1.7.0"
               ├─► Версию Badger изменила миграция Pangolin? ──► рестарт Traefik + повторная проверка
               ├─[Ошибка только плагина]──► частичный откат Badger + рестарт Traefik
               │
-              ├─[Успех]──► docker image prune ──► Выход (код 0)
+              ├─[Успех]──► docker image prune ──► Правила Hub + allowlist ──► Выход (код 0 / 3)
               │
               └─[Сбой]
                     │
@@ -558,6 +861,10 @@ BADGER_PIN="v1.7.0"
 | Логи Traefik | Нет ошибок загрузки плагинов с момента запуска (см. [Защита плагина Badger](#защита-плагина-badger)) |
 
 Если хотя бы один контейнер не удовлетворяет критериям — попытка считается неудачной. Скрипт повторяет проверку через `HEALTH_INTERVAL` секунд, всего до `HEALTH_RETRIES` раз.
+
+Исключение — сервисы из `HEALTH_IGNORE_SERVICES` (по умолчанию `crowdsec-manager`): их проблемы выводятся в лог как `WARN`, но не вызывают откат всего стека. CrowdSec в этот список **не входит**: он стоит на пути всего трафика, и его сбой — повод для отката.
+
+> Если `docker compose up -d` сам завершился с ошибкой (например, `traefik` не дождался `crowdsec` в состоянии `healthy`), скрипт не прерывается, а переходит к health check — тот увидит незапущенные контейнеры и выполнит откат.
 
 ### Временна́я шкала health check (значения по умолчанию)
 
@@ -732,6 +1039,7 @@ crontab -e
 | `0` | Успех: обновление выполнено, не требуется, запуск в режиме `-info`, либо успешное завершение `-backup` / `-restore` / `-cloudflare` / `-cloudflare-off` | — |
 | `1` | Health check провален, откат выполнен успешно; ошибка в `-backup`/`-restore` (архив не найден/повреждён, стек нездоров после восстановления); либо ошибки Cloudflare API в `-dns-sync`/`-cloudflare` | Стек работает на предыдущих версиях (или конфигурации). Проверьте лог для диагностики. |
 | `2` | Health check провален, откат тоже провален | **Требуется ручное вмешательство.** Используйте резервные копии `*.bak.ДАТА`. |
+| `3` | Стек в порядке (или обновлён), но CrowdSec не отвечает после обновления правил Hub | Проверьте `docker logs crowdsec`. Сайты работают без WAF (или полностью заблокированы, если включён `crowdsecAppsecUnreachableBlock`). |
 
 ---
 
@@ -741,10 +1049,14 @@ crontab -e
 /root/pangolin/
 ├── docker-compose.yml                          # Конфиг стека (обновляется скриптом)
 ├── docker-compose.yml.bak.DDMMYYYY_HHMMSS      # Резервная копия
+├── crowdsec-manager/                           # Данные и бэкапы crowdsec-manager (если установлен)
 └── config/
+    ├── crowdsec/                               # Конфигурация CrowdSec, acquis.d/, db/ (если установлен)
     └── traefik/
         ├── traefik_config.yml                  # Конфиг Traefik/Badger (обновляется скриптом)
-        └── traefik_config.yml.bak.DDMMYYYY_HHMMSS  # Резервная копия
+        ├── traefik_config.yml.bak.DDMMYYYY_HHMMSS  # Резервная копия
+        ├── dynamic_config.yml                  # Middleware (badger, crowdsec)
+        └── logs/access.log                     # Access-лог для CrowdSec (не входит в бэкап)
 
 /root/pangolin/
 └── .cf-dns.env                                 # Настройки интеграции с Cloudflare (создаётся -cloudflare, права 600)
@@ -753,7 +1065,11 @@ crontab -e
 └── pangolin_DDMMYYYY_HHMMSS.tar.gz             # Полные резервные копии (хранится BACKUP_KEEP шт.)
 
 /etc/cron.d/
-└── pangolin-cf-dns                             # cron-задача DNS-синхронизации (создаётся -cloudflare)
+├── pangolin-cf-dns                             # cron-задача DNS-синхронизации (создаётся -cloudflare)
+└── pangolin-allowlist                          # cron-задача синхронизации allowlist (создаётся -allowlist-on)
+
+/etc/logrotate.d/
+└── pangolin-traefik                            # Ротация access-лога Traefik (из crowdsec-kit)
 
 /var/log/
 ├── pangolin-update.log                         # Текущий лог
