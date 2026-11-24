@@ -1,0 +1,90 @@
+# /etc/pangolin-update.conf — настройки pangolin-update.sh
+#
+# Установка:
+#   cp pangolin-update.conf.example /etc/pangolin-update.conf
+#   chown root:root /etc/pangolin-update.conf && chmod 600 /etc/pangolin-update.conf
+#
+# Файл исполняется как bash от root, поэтому скрипт принимает его, только
+# если владелец — root и запись для группы и остальных запрещена.
+# Раскомментируйте только то, что меняете: значения ниже — встроенные по
+# умолчанию. Обновление скрипта этот файл не затрагивает.
+# Другой путь к файлу: PANGOLIN_UPDATE_CONF=/путь pangolin-update.sh
+
+# ─── Пути ────────────────────────────────────────────────────────────────────
+#PANGOLIN_DIR="/root/pangolin"
+#COMPOSE_FILE="${PANGOLIN_DIR}/docker-compose.yml"
+#TRAEFIK_CONFIG="${PANGOLIN_DIR}/config/traefik/traefik_config.yml"
+#TRAEFIK_DYNAMIC_CONFIG="${PANGOLIN_DIR}/config/traefik/dynamic_config.yml"
+#PANGOLIN_DB="${PANGOLIN_DIR}/config/db/db.sqlite"
+#LOG_FILE="/var/log/pangolin-update.log"
+#LOG_MAX_LINES=5000            # ротация лога при превышении
+#LOG_KEEP=5                    # сколько ротированных логов (.gz) хранить
+#LOCK_FILE="/run/pangolin-update.lock"
+#LOCK_WAIT=120                 # сколько секунд ждать завершения другого запуска
+#STATE_DIR="/var/lib/pangolin-update"
+
+# ─── Политика обновлений ─────────────────────────────────────────────────────
+#MIN_RELEASE_AGE_HOURS=24      # не ставить релизы моложе N часов (0 = сразу)
+#ALLOW_MAJOR_UPGRADE=false     # true = разрешить переход на новую мажорную версию
+#UPDATE_HOLD=false             # true = обновления приостановлены (как --hold)
+#GITHUB_TOKEN=""               # необязательно: лимит GitHub API 5000 запросов/час вместо 60
+#PRUNE_MODE="previous"         # previous | immediate | none — когда удалять старые образы
+#BADGER_PIN=""                 # закрепить Badger, например "v1.7.0"
+#BADGER_PROBE=true             # проверять Traefik + плагины в тестовом контейнере
+#BADGER_PROBE_WAIT=30
+#PROBE_CACHE_HOURS=24          # сколько помнить результат пробы
+
+# ─── Health check ────────────────────────────────────────────────────────────
+#HEALTH_INITIAL_WAIT=5
+#HEALTH_INTERVAL=10
+#HEALTH_RETRIES=15
+#HEALTH_MIN_UPTIME=15          # контейнер без healthcheck должен проработать N секунд
+#RESTART_THRESHOLD=3
+#HEALTH_IGNORE_SERVICES="crowdsec-manager"
+#HEALTH_HTTP_CHECK=true        # запрос через Traefik до и после изменений
+#HEALTH_URL=""                 # пусто = dashboard_url из config/config.yml
+#HEALTH_HTTP_RESOLVE_IP="127.0.0.1"
+
+# ─── Резервные копии ─────────────────────────────────────────────────────────
+#BACKUP_DIR="/root/pangolin-backups"
+#BACKUP_KEEP=7                 # архивов и *.bak.* каждого конфига
+#BACKUP_MODE="hot"             # hot = без остановки стека (SQLite); cold = с остановкой
+#BACKUP_MIN_FREE_MB=200
+#LOGS_EXCLUDE="config/traefik/logs"
+
+# ─── Уведомления ─────────────────────────────────────────────────────────────
+#NOTIFY_ON="problems"          # problems (WARN/ERROR) | all | none
+#NOTIFY_URL="https://ntfy.sh/my-pangolin-topic"
+#TELEGRAM_BOT_TOKEN=""
+#TELEGRAM_CHAT_ID=""
+# Своя команда; получает переменные PU_LEVEL, PU_EVENT, PU_MESSAGE, PU_HOST, PU_TITLE:
+#NOTIFY_CMD='curl -fsS -X POST -H "Content-Type: text/plain" --data-binary "$PU_TITLE: $PU_MESSAGE" https://example.org/hook'
+# healthchecks.io-совместимый пинг после каждого обычного запуска: <URL>/<код выхода>
+#HEARTBEAT_URL="https://hc-ping.com/<uuid>"
+
+# ─── Cloudflare ──────────────────────────────────────────────────────────────
+#CF_ENV_FILE="${PANGOLIN_DIR}/.cf-dns.env"
+#CF_SYNC_INTERVAL=5
+#CF_FULL_RESYNC_MIN=360        # полная сверка с Cloudflare не реже раза в N минут
+#CF_DELETE_STALE=false         # true = удалять СВОИ записи удалённых ресурсов
+
+# ─── CrowdSec ────────────────────────────────────────────────────────────────
+#CROWDSEC_SERVICE="crowdsec"
+#CROWDSEC_AUTO_UPDATE=true
+#CROWDSEC_HUB_UPDATE=true
+#ALLOWLIST_SYNC=true
+#ALLOWLIST_NAME="pangolin-infra"
+#ALLOWLIST_EXTRA=""            # IP/подсети через пробел
+#ALLOWLIST_NEWT=true           # добавлять публичные IP сайтов Newt
+#ALLOWLIST_NEWT_EXCLUDE=""     # имена сайтов через запятую (CGNAT, общий офисный IP)
+#ALLOWLIST_NEWT_MAX_AGE_DAYS=7
+#ALLOWLIST_SYNC_INTERVAL=10
+#SERVER_IP_CACHE_MIN=60
+
+# ─── Установка CrowdSec (--crowdsec-install) ─────────────────────────────────
+#CROWDSEC_IMAGE_TAG="v1.8.1"
+#CROWDSEC_BOUNCER_VERSION="v1.8.1"
+#CROWDSEC_INSTALL_MANAGER=false        # то же, что --with-manager
+#CROWDSEC_ENTRYPOINT="websecure"
+#CROWDSEC_BOUNCER_NAME="traefik-bouncer"
+#CROWDSEC_CLIENT_TRUSTED_IPS=""        # клиенты, которых bouncer не проверяет (через пробел)
